@@ -49,6 +49,13 @@ DEFAULT_OSD_FONT = "Segoe UI" if IS_WINDOWS else "Adwaita Sans"
 # Keeps a console window from flashing up when we shell out to ffprobe.
 SUBPROCESS_FLAGS = 0x08000000 if IS_WINDOWS else 0  # CREATE_NO_WINDOW
 
+# Whether finishing a video should carry on into the rest of its folder.
+# On Linux the Flatpak cannot read that folder without host permission, so
+# this is off unless the user has asked for it; Windows has no such gate,
+# which made every video roll on into whatever else happened to be sitting
+# beside it. Off here matches what the Flatpak does out of the box.
+AUTOCREATE_PLAYLIST = "no" if IS_WINDOWS else "filter"
+
 
 # --- Flatpak ---------------------------------------------------------------
 

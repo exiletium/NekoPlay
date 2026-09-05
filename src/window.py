@@ -42,6 +42,7 @@ from .mpris import MPRIS
 from .mpv_gl_area import ThumbPreviewGLArea, VideoGLArea
 from .options import OptionsMenuButton
 from .platform_compat import (
+    AUTOCREATE_PLAYLIST,
     DEFAULT_OSD_FONT,
     DEFAULT_SUB_FONT,
     MPV_PATH_SEP,
@@ -246,12 +247,12 @@ class CineWindow(Adw.ApplicationWindow):
             ytdl=True,
             ytdl_raw_options="yes-playlist=",
             cursor_autohide_fs_only=True,
-            autocreate_playlist="filter",
-            # 'filter' queues every neighbouring file mpv considers media,
-            # images included, so finishing an episode in a cluttered folder
-            # walked into the screenshots next to it. Emptying the list keeps
-            # them out of the auto playlist; an image opened deliberately
-            # still plays, because this only classifies extensions.
+            autocreate_playlist=AUTOCREATE_PLAYLIST,
+            # Where the auto playlist is on, 'filter' queues every
+            # neighbouring file mpv considers media, images included, so an
+            # episode was followed by the screenshots next to it. Emptying
+            # the list keeps them out; an image opened deliberately still
+            # plays, because this only classifies extensions.
             image_exts="",
             save_watch_history=True,
             watch_history_path=WATCH_HISTORY_JSONL,

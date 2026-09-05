@@ -33,7 +33,10 @@ Then, from the top of the source tree:
 ```bash
 ./build-aux/windows/build.sh                    # meson configure/compile/install
 ./build-aux/windows/bundle.sh --with-anime4k    # collect into dist/NekoPlay
+./build-aux/windows/installer.sh                # wrap it in NekoPlay-<ver>-Setup.exe
 ```
+
+The installer step additionally needs `mingw-w64-ucrt-x86_64-nsis`.
 
 `dist/NekoPlay/` is self-contained: about 330 MB, runs on a machine with no
 MSYS2 installed, and can be zipped, moved or renamed freely. `nekoplay.exe`
@@ -42,6 +45,26 @@ works out where it lives at startup and everything else follows from that.
 Drop `--with-anime4k` to skip fetching the shaders; the build then needs no
 network. The archive is pinned to the same release and SHA256 as the Flatpak
 manifest.
+
+## The installer
+
+[`nekoplay.nsi`](nekoplay.nsi) packs the same folder into a per-machine
+installer, around 80 MB compressed. It installs under Program Files, puts a
+shortcut in the Start Menu for all users, registers an Add/Remove Programs
+entry, and writes an uninstaller. A desktop shortcut and file associations
+are optional components.
+
+The associations register NekoPlay under **Open With** for the common video
+containers rather than seizing the default player, which is as much as an
+installer has been permitted to do since Windows 8.
+
+Settings live in the registry and in `%LOCALAPPDATA%\NekoPlay`, and the
+uninstaller leaves both alone so a reinstall picks up where you left off.
+
+`/S` installs silently, and replaces an existing install without prompting.
+
+Nothing here is code-signed, so SmartScreen will warn on first run until the
+binary builds reputation or a certificate is added.
 
 ## How the port fits together
 
