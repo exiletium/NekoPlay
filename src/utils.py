@@ -142,6 +142,18 @@ def _run_once(func, *args, **kwargs):
 
 
 def idle_add_once(func, *args, **kwargs) -> int:
+    """Run func on the main loop, in the same priority band as drawing.
+
+    Nearly every mpv property observer reaches the widgets through here, and
+    at the default idle priority (200) those callbacks sit below both GTK's
+    redraw (120) and the render request mpv queues for each frame (100). A
+    renderer slow enough to keep the loop busy every frame therefore starves
+    them completely: the video plays on while the seek bar, the clock and
+    the play button stay frozen wherever they last got a turn. Sharing the
+    high-idle band means they interleave with drawing instead, and state is
+    applied before the frame that shows it.
+    """
+    kwargs.setdefault("priority", GLib.PRIORITY_HIGH_IDLE)
     return GLib.idle_add(_run_once, func, *args, **kwargs)
 
 

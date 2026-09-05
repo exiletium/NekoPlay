@@ -247,6 +247,12 @@ class CineWindow(Adw.ApplicationWindow):
             ytdl_raw_options="yes-playlist=",
             cursor_autohide_fs_only=True,
             autocreate_playlist="filter",
+            # 'filter' queues every neighbouring file mpv considers media,
+            # images included, so finishing an episode in a cluttered folder
+            # walked into the screenshots next to it. Emptying the list keeps
+            # them out of the auto playlist; an image opened deliberately
+            # still plays, because this only classifies extensions.
+            image_exts="",
             save_watch_history=True,
             watch_history_path=WATCH_HISTORY_JSONL,
         )
