@@ -1,0 +1,35 @@
+/* Resources compiled into nekoplay.exe: the icon Explorer and the taskbar
+ * show, and the version block the file properties dialog reads.
+ *
+ * SPDX-License-Identifier: GPL-3.0-or-later
+ */
+
+#include <windows.h>
+
+1 ICON "nekoplay.ico"
+
+1 VERSIONINFO
+FILEVERSION 1, 8, 5, 0
+PRODUCTVERSION 1, 8, 5, 0
+FILEOS VOS_NT_WINDOWS32
+FILETYPE VFT_APP
+BEGIN
+    BLOCK "StringFileInfo"
+    BEGIN
+        BLOCK "040904B0"
+        BEGIN
+            VALUE "CompanyName", "Nyarch Linux"
+            VALUE "FileDescription", "NekoPlay"
+            VALUE "FileVersion", "1.8.5"
+            VALUE "InternalName", "nekoplay"
+            VALUE "LegalCopyright", "Copyright (C) 2026 Diego Povliuk. GPL-3.0-or-later."
+            VALUE "OriginalFilename", "nekoplay.exe"
+            VALUE "ProductName", "NekoPlay"
+            VALUE "ProductVersion", "1.8.5"
+        END
+    END
+    BLOCK "VarFileInfo"
+    BEGIN
+        VALUE "Translation", 0x409, 1200
+    END
+END

@@ -1,0 +1,8 @@
+# The build scripts run under bash in MSYS2, which does not tolerate CRLF,
+# and the Python and meson files are shared with the Linux build. Keep the
+# whole tree LF regardless of the checkout platform's autocrlf setting.
+* text=auto eol=lf
+
+*.ico binary
+*.png binary
+*.mo binary

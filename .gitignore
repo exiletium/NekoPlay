@@ -8,3 +8,5 @@ repo
 .vscode
 /src/__pycache__
 moe.nyarchlinux.nekoplay.flatpak
+_install
+dist

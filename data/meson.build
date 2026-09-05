@@ -1,3 +1,8 @@
+# Desktop entries, AppStream metadata and D-Bus activation are freedesktop
+# mechanisms with no counterpart on Windows. The schema and the icons are
+# not: GSettings and the icon theme are used on both.
+if not is_windows
+
 desktop_file = i18n.merge_file(
         input: 'moe.nyarchlinux.nekoplay.desktop.in',
        output: 'moe.nyarchlinux.nekoplay.desktop',
@@ -24,6 +29,8 @@ appstreamcli = find_program('appstreamcli', required: false, disabler: true)
 test('Validate appstream file', appstreamcli,
      args: ['validate', '--no-net', '--explain', appstream_file])
 
+endif
+
 install_data('moe.nyarchlinux.nekoplay.gschema.xml',
   install_dir: get_option('datadir') / 'glib-2.0' / 'schemas'
 )
@@ -34,13 +41,15 @@ test('Validate schema file',
      args: ['--strict', '--dry-run', meson.current_source_dir()])
 
 
-service_conf = configuration_data()
-service_conf.set('bindir', get_option('prefix') / get_option('bindir'))
-configure_file(
-  input: 'moe.nyarchlinux.nekoplay.service.in',
-  output: 'moe.nyarchlinux.nekoplay.service',
-  configuration: service_conf,
-  install_dir: get_option('datadir') / 'dbus-1' / 'services'
-)
+if not is_windows
+  service_conf = configuration_data()
+  service_conf.set('bindir', get_option('prefix') / get_option('bindir'))
+  configure_file(
+    input: 'moe.nyarchlinux.nekoplay.service.in',
+    output: 'moe.nyarchlinux.nekoplay.service',
+    configuration: service_conf,
+    install_dir: get_option('datadir') / 'dbus-1' / 'services'
+  )
+endif
 
 subdir('icons')

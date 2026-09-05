@@ -22,23 +22,18 @@ import logging
 import gi
 import mpv
 
-from .utils import get_display_param
+from .platform_compat import (
+    GL_FRAMEBUFFER_BINDING,
+    get_display_param,
+    gl_get_integerv,
+    gl_get_proc_address,
+)
 
 gi.require_version("GLib", "2.0")
 gi.require_version("Gtk", "4.0")
 from gi.repository import GLib, Gtk
 
 logger = logging.getLogger(__name__)
-
-LIBEGL = ctypes.CDLL("libEGL.so.1")
-egl_get_proc_address = LIBEGL.eglGetProcAddress
-egl_get_proc_address.restype = ctypes.c_void_p
-egl_get_proc_address.argtypes = [ctypes.c_char_p]
-
-GL_FRAMEBUFFER_BINDING = 0x8CA6
-LIBGL = ctypes.CDLL("libGL.so.1")
-glGetIntegerv = LIBGL.glGetIntegerv
-glGetIntegerv.argtypes = [ctypes.c_uint, ctypes.POINTER(ctypes.c_int)]
 
 DISPLAY_PARAM = get_display_param()
 
@@ -54,7 +49,7 @@ class BaseGLArea(Gtk.GLArea):
     def _setup_mpv_context(self, mpv_instance: mpv.MPV) -> mpv.MpvRenderContext | None:
         try:
             proc_address_fn = mpv.MpvGlGetProcAddressFn(
-                lambda _inst, name: egl_get_proc_address(name)
+                lambda _inst, name: gl_get_proc_address(name)
             )
             ctx = mpv.MpvRenderContext(
                 mpv_instance,
@@ -76,7 +71,7 @@ class BaseGLArea(Gtk.GLArea):
 
     def _on_render(self, _area, _context):
         try:
-            glGetIntegerv(GL_FRAMEBUFFER_BINDING, self._fbo)
+            gl_get_integerv(GL_FRAMEBUFFER_BINDING, self._fbo)
             assert self._ctx is not None
             self._ctx.render(
                 flip_y=True,

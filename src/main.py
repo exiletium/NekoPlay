@@ -19,6 +19,7 @@
 
 import logging
 import os
+import shutil
 import subprocess
 import sys
 from gettext import gettext as _
@@ -33,16 +34,22 @@ gi.require_version("Gtk", "4.0")
 from gi.repository import Adw, Gio, GLib, Gtk
 
 from .mpris import MPRIS
+from .platform_compat import IS_WINDOWS, SUBPROCESS_FLAGS
 from .preferences import Preferences, settings
 from .save_session import is_same_playlist
 from .window import CineWindow
 
 logger = logging.getLogger(__name__)
 
-os.environ["GSK_RENDERER"] = "gl"
+if not IS_WINDOWS:
+    os.environ["GSK_RENDERER"] = "gl"
 
-# Set the icon shown in gnome sound settings
-os.environ["PIPEWIRE_PROPS"] = '{application.icon-name="moe.nyarchlinux.nekoplay"}'
+    # Set the icon shown in gnome sound settings
+    os.environ["PIPEWIRE_PROPS"] = '{application.icon-name="moe.nyarchlinux.nekoplay"}'
+
+# On Windows GDK already prefers GL and falls back on its own, so pinning a
+# renderer here would only stop it reaching for Vulkan when GL is refused.
+# See build-aux/windows/README.md on Direct Composition.
 
 
 class CineApplication(Adw.Application):
@@ -98,10 +105,14 @@ class CineApplication(Adw.Application):
                 if first_video_path:
                     break
 
-            if first_video_path:
+            # ffprobe only sizes the window before the first frame arrives;
+            # it ships with the Flatpak but is merely optional on Windows.
+            ffprobe = shutil.which("ffprobe")
+
+            if first_video_path and ffprobe:
                 try:
                     cmd = [
-                        "ffprobe",
+                        ffprobe,
                         "-v",
                         "error",
                         "-select_streams",
@@ -113,7 +124,11 @@ class CineApplication(Adw.Application):
                         first_video_path,
                     ]
                     output = subprocess.check_output(
-                        cmd, text=True, timeout=2, stderr=subprocess.DEVNULL
+                        cmd,
+                        text=True,
+                        timeout=2,
+                        stderr=subprocess.DEVNULL,
+                        creationflags=SUBPROCESS_FLAGS,
                     ).strip()
 
                     if output:

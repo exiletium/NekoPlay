@@ -59,7 +59,13 @@ def get_shaders_dir() -> str:
     # Common install paths
     from .utils import CONFIG_DIR
 
+    # This module installs to <pkgdatadir>/cine/, the shaders to
+    # <pkgdatadir>/shaders/, so walking up from here finds them wherever
+    # the app was unpacked - which on Windows is anywhere the user likes.
+    pkgdatadir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
     candidates = [
+        os.path.join(pkgdatadir, "shaders"),  # Relative to the install
         "/app/share/cine/shaders",  # Flatpak
         "/usr/share/cine/shaders",  # System install
         os.path.join(CONFIG_DIR, "shaders"),  # User override/dev fallback

@@ -50,7 +50,19 @@ In case you want to support Nyarch, here is the Nyarch Linux donation button
 
 You can install from the .flatpak file from latest release on any distribution:
 
+On Windows, unpack the portable `NekoPlay` folder anywhere and run
+`nekoplay.exe` — nothing else needs installing.
 
 ### Build from source
 
 Clone the repo in GNOME Builder and press run.
+
+For Windows, build in an MSYS2 UCRT64 shell:
+
+```bash
+./build-aux/windows/build.sh
+./build-aux/windows/bundle.sh --with-anime4k
+```
+
+See [build-aux/windows/README.md](build-aux/windows/README.md) for the
+dependency list and notes on how the port works.

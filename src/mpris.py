@@ -28,6 +28,7 @@ gi.require_version("Gio", "2.0")
 gi.require_version("GLib", "2.0")
 from gi.repository import Adw, Gio, GLib
 
+from .platform_compat import IS_WINDOWS
 from .utils import idle_add_once
 
 logger = logging.getLogger(__name__)
@@ -92,6 +93,13 @@ class MPRIS:
         self._bus_name = f"org.mpris.MediaPlayer2.{APP_ID}"
         self._path = "/org/mpris/MediaPlayer2"
         self._con = None
+
+        if IS_WINDOWS:
+            # MPRIS is a freedesktop spec spoken over the D-Bus session bus,
+            # and Windows has neither. Every update_* method below already
+            # returns early while _con is None, so the object stays usable
+            # and callers do not have to know.
+            return
 
         Gio.bus_get(Gio.BusType.SESSION, None, self._on_bus_acquired)
 

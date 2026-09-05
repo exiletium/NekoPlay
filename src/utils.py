@@ -17,7 +17,6 @@
 #
 # SPDX-License-Identifier: GPL-3.0-or-later
 
-import ctypes
 import logging
 import os
 from urllib.parse import urlparse
@@ -26,19 +25,13 @@ import gi
 
 gi.require_version("Gdk", "4.0")
 gi.require_version("GLib", "2.0")
-gi.require_version("GdkX11", "4.0")
-gi.require_version("GdkWayland", "4.0")
-from gi.repository import (
-    Gdk,
-    GdkWayland,  # pyright: ignore[reportAttributeAccessIssue]
-    GdkX11,
-    GLib,
-)
+from gi.repository import Gdk, GLib
+
+from .platform_compat import CONFIG_DIR_NAME
 
 logging.basicConfig(format="%(levelname)s: [%(filename)s:%(lineno)d] %(message)s")
 logger = logging.getLogger(__name__)
 
-gtk = ctypes.CDLL("libgtk-4.so.1")
 display = Gdk.Display.get_default()
 
 try:
@@ -49,7 +42,7 @@ try:
 
     BASE_CONFIG = GLib.get_user_config_dir()
 
-    CONFIG_DIR = join(BASE_CONFIG, "cine")
+    CONFIG_DIR = join(BASE_CONFIG, CONFIG_DIR_NAME)
     INPUT_CONF = join(CONFIG_DIR, "input.conf")
     MPV_CONF = join(CONFIG_DIR, "mpv.conf")
     WATCH_HISTORY_JSONL = join(CONFIG_DIR, "watch_history.jsonl")
@@ -158,35 +151,6 @@ def timeout_add_once(interval: int, func, *args, **kwargs) -> int:
 
 def timeout_add_seconds_once(interval: int, func, *args, **kwargs) -> int:
     return GLib.timeout_add_seconds(interval, _run_once, func, *args, **kwargs)
-
-
-def get_display_param():
-    param = {}
-
-    # see https://gist.github.com/omnp/6ac3385e2b3f6cab987d84e6477e636a
-
-    def get_pointer(display):
-        ctypes.pythonapi.PyCapsule_GetPointer.restype = ctypes.c_void_p
-        ctypes.pythonapi.PyCapsule_GetPointer.argtypes = (ctypes.py_object,)
-        return ctypes.pythonapi.PyCapsule_GetPointer(display.__gpointer__, None)
-
-    try:
-        if isinstance(display, GdkWayland.WaylandDisplay):
-            gtk.gdk_wayland_display_get_wl_display.restype = ctypes.c_void_p
-            gtk.gdk_wayland_display_get_wl_display.argtypes = [ctypes.c_void_p]
-            ptr = gtk.gdk_wayland_display_get_wl_display(get_pointer(display))
-            if ptr:
-                param["wl_display"] = ptr
-        elif isinstance(display, GdkX11.X11Display):
-            gtk.gdk_x11_display_get_xdisplay.restype = ctypes.c_void_p
-            gtk.gdk_x11_display_get_xdisplay.argtypes = [ctypes.c_void_p]
-            ptr = gtk.gdk_x11_display_get_xdisplay(get_pointer(display))
-            if ptr:
-                param["x11_display"] = ptr
-    except Exception:
-        logger.exception("get_display_param failed")
-
-    return param
 
 
 def format_time(seconds):

@@ -29,18 +29,107 @@ VERSION = '@VERSION@'
 pkgdatadir = '@pkgdatadir@'
 localedir = '@localedir@'
 
+if os.name == 'nt':
+    # The Windows bundle can be moved anywhere, so the prefix meson knew
+    # about at build time says nothing about where these files ended up.
+    # This script installs to <root>/share/cine/, so everything else is a
+    # fixed offset away from it.
+    pkgdatadir = os.path.dirname(os.path.abspath(__file__))
+    datadir = os.path.dirname(pkgdatadir)
+    localedir = os.path.join(datadir, 'locale')
+
+    # Since 3.8 ctypes ignores PATH, so name the folder holding
+    # libmpv-2.dll rather than trusting the launcher's environment.
+    bindir = os.path.join(os.path.dirname(datadir), 'bin')
+    if os.path.isdir(bindir):
+        os.add_dll_directory(bindir)
+
+    # Built against the GUI subsystem, so there are no standard streams to
+    # inherit and every print() in the app would raise. A log file next to
+    # the settings is more use than os.devnull when a user reports a crash.
+    if sys.stdout is None or sys.stderr is None:
+        try:
+            log_dir = os.path.join(
+                os.environ.get('LOCALAPPDATA') or os.path.expanduser('~'),
+                'NekoPlay',
+            )
+            os.makedirs(log_dir, exist_ok=True)
+            log = open(
+                os.path.join(log_dir, 'nekoplay.log'),
+                'w',
+                encoding='utf-8',
+                errors='replace',
+                buffering=1,
+            )
+        except OSError:
+            log = open(os.devnull, 'w')
+
+        sys.stdout = sys.stdout or log
+        sys.stderr = sys.stderr or log
+
+    # mpv parses its own option values with the C locale and complains
+    # loudly about anything else.
+    os.environ['LC_NUMERIC'] = 'C'
+
 sys.path.insert(1, pkgdatadir)
 signal.signal(signal.SIGINT, signal.SIG_DFL)
+
+
+def bind_locale():
+    """Tell libintl where our catalogues are.
+
+    This is what translates the strings inside GTK and libadwaita. Windows
+    builds of Python have no locale.bindtextdomain, so libintl has to be
+    called directly; wbindtextdomain is the variant that copes with a
+    non-ASCII install path.
+    """
+    if hasattr(locale, 'bindtextdomain'):
+        locale.bindtextdomain('cine', localedir)
+        locale.textdomain('cine')
+        return
+
+    if os.name != 'nt':
+        # Some builds of Python simply do not expose it; that is the same
+        # dead end this had before, and only Windows has a way around it.
+        raise AttributeError('locale.bindtextdomain')
+
+    import ctypes
+    import ctypes.util
+
+    # Since 3.8 ctypes no longer walks PATH, which is where this sits in a
+    # plain MSYS2 checkout; inside the bundle add_dll_directory found it
+    # already and the bare name resolves.
+    libintl = ctypes.CDLL(ctypes.util.find_library('libintl-8.dll')
+                          or 'libintl-8.dll')
+
+    def entry(*names):
+        for name in names:
+            fn = getattr(libintl, name, None)
+            if fn is not None:
+                return fn
+        raise AttributeError(names[0])
+
+    # GNU gettext exports its own functions under a libintl_ prefix and
+    # only aliases some of them; the wide variant, which is the one that
+    # copes with a non-ASCII install path, is never aliased.
+    bind_w = entry('libintl_wbindtextdomain', 'wbindtextdomain')
+    bind_w.argtypes = [ctypes.c_char_p, ctypes.c_wchar_p]
+    bind_w(b'cine', localedir)
+
+    textdomain = entry('libintl_textdomain', 'textdomain')
+    textdomain.argtypes = [ctypes.c_char_p]
+    textdomain(b'cine')
+
+
 try:
-  locale.bindtextdomain('cine', localedir)
-  locale.textdomain('cine')
-except:
-  print('Cannot set locale.')
+    bind_locale()
+except Exception as error:
+    print(f'Cannot set locale: {error!r}')
 try:
-  gettext.bindtextdomain('cine', localedir)
-  gettext.textdomain('cine')
+    gettext.bindtextdomain('cine', localedir)
+    gettext.textdomain('cine')
 except:
-  print('Cannot load translations.')
+    print('Cannot load translations.')
 
 if __name__ == '__main__':
     import gi

@@ -41,6 +41,14 @@ from .history import HistoryDialog
 from .mpris import MPRIS
 from .mpv_gl_area import ThumbPreviewGLArea, VideoGLArea
 from .options import OptionsMenuButton
+from .platform_compat import (
+    DEFAULT_OSD_FONT,
+    DEFAULT_SUB_FONT,
+    MPV_PATH_SEP,
+    inhibit_idle,
+    is_document_portal_path,
+    uninhibit_idle,
+)
 from .playlist import Playlist, PlaylistItemObj
 from .preferences import settings, sync_mpv_with_settings
 from .save_session import (
@@ -202,15 +210,28 @@ class CineWindow(Adw.ApplicationWindow):
             audio_display="embedded-first",
             audio_file_auto="fuzzy",
             sub_auto="fuzzy",
-            sub_file_paths="sub:subs:subtitles:Sub:Subs:Subtitles:srt:srts:Srt:Srts",
+            sub_file_paths=MPV_PATH_SEP.join(
+                (
+                    "sub",
+                    "subs",
+                    "subtitles",
+                    "Sub",
+                    "Subs",
+                    "Subtitles",
+                    "srt",
+                    "srts",
+                    "Srt",
+                    "Srts",
+                )
+            ),
             sub_border_size=2,
             sub_shadow_offset=0.6,
             sub_border_color="#B6000000",
             sub_shadow_color="#97000000",
             sub_color="#ebebeb",
             sub_use_margins=False,
-            sub_font="Adwaita Sans SemiBold",
-            osd_font="Adwaita Sans",
+            sub_font=DEFAULT_SUB_FONT,
+            osd_font=DEFAULT_OSD_FONT,
             osd_bold=True,
             osd_bar=False,
             osd_blur=1,
@@ -1709,13 +1730,9 @@ class CineWindow(Adw.ApplicationWindow):
             should_inhibit = False
 
         if should_inhibit and self._inhibit_cookie == 0:
-            self._inhibit_cookie = self.app.inhibit(
-                self,
-                Gtk.ApplicationInhibitFlags.IDLE,
-                "Playing Media",
-            )
+            self._inhibit_cookie = inhibit_idle(self.app, self, "Playing Media")
         elif not should_inhibit and self._inhibit_cookie != 0:
-            self.app.uninhibit(self._inhibit_cookie)
+            uninhibit_idle(self.app, self._inhibit_cookie)
             self._inhibit_cookie = 0
 
     def _show_icon_indicator(self):
@@ -1742,7 +1759,7 @@ class CineWindow(Adw.ApplicationWindow):
             pass
 
         if self._inhibit_cookie:
-            self.app.uninhibit(self._inhibit_cookie)
+            uninhibit_idle(self.app, self._inhibit_cookie)
 
         return False
 
@@ -1755,7 +1772,7 @@ class CineWindow(Adw.ApplicationWindow):
 
             if (
                 self.has_some_doc_path
-                or f"/run/user/{os.getuid()}/doc/" not in item.get("filename")
+                or not is_document_portal_path(item.get("filename"))
                 or has_host_permission
             ):
                 continue

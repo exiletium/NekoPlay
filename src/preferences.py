@@ -30,10 +30,24 @@ gi.require_version("Gtk", "4.0")
 from gi.repository import Adw, Gdk, Gio, Gtk
 
 from .anime4k import MODE_INDEX_MAP, MODE_TO_INDEX, apply_anime4k_shaders
+from .platform_compat import DEFAULT_SUB_FONT, IS_WINDOWS
 from .utils import CONFIG_DIR, display, has_host_permission, is_flatpak
 
 logger = logging.getLogger(__name__)
 settings = Gio.Settings.new("moe.nyarchlinux.nekoplay")
+
+
+def get_subtitle_font() -> str:
+    """The subtitle face, honouring the user's pick if they made one.
+
+    The schema default is Adwaita Sans, which comes with the GNOME runtime
+    and so is not installed on Windows. Substituting only when the key was
+    never written keeps an explicit choice intact.
+    """
+    if IS_WINDOWS and settings.get_user_value("subtitle-font") is None:
+        return DEFAULT_SUB_FONT
+
+    return settings.get_string("subtitle-font")
 
 
 def sync_mpv_with_settings(window):
@@ -41,7 +55,7 @@ def sync_mpv_with_settings(window):
     mpv = window.mpv
     mpv["sub-color"] = settings.get_string("subtitle-color")
     mpv["sub-scale"] = settings.get_double("subtitle-scale")
-    mpv["sub-font"] = settings.get_string("subtitle-font")
+    mpv["sub-font"] = get_subtitle_font()
     mpv["slang"] = settings.get_string("subtitle-languages")
     mpv["alang"] = settings.get_string("audio-languages")
     mpv["volume"] = settings.get_int("volume")
@@ -115,8 +129,7 @@ class Preferences(Adw.Dialog):
         self._bind_ui()
         self._setup_mpv_updates()
 
-        font = settings.get_string("subtitle-font")
-        self.font_label.set_label(font)
+        self.font_label.set_label(get_subtitle_font())
 
         self.sub_color_btn.connect("notify::rgba", self._on_sub_color_selected)
         self.reset_sub_color.connect("clicked", self._on_sub_color_reset)
@@ -343,9 +356,10 @@ class Preferences(Adw.Dialog):
         dialog.choose_face(self._win, None, None, callback)
 
     def _on_font_reset(self, _button):
-        default_font = "Adwaita Sans SemiBold"
-        settings.set_string("subtitle-font", default_font)
-        self.font_label.set_label(default_font)
+        # Clearing the key rather than writing the schema default back lets
+        # get_subtitle_font pick whichever face this platform actually has.
+        settings.reset("subtitle-font")
+        self.font_label.set_label(get_subtitle_font())
 
     @Gtk.Template.Callback()
     def _on_open_config_dir(self, _button):
