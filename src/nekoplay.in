@@ -71,6 +71,17 @@ if os.name == 'nt':
     # loudly about anything else.
     os.environ['LC_NUMERIC'] = 'C'
 
+    # GSK will only present with the GPU once GDK has built a Direct
+    # Composition device, and the MSYS2 build of GTK carries a patch
+    # (003-default-dcomp-off.patch) making that opt-in. Without it the whole
+    # window, video included, is composited by the software renderer: 4K60
+    # playback measured 88% of a CPU core rather than 51%.
+    #
+    # This has to happen before anything imports gi, because GDK reads it
+    # while its library is loading. setdefault leaves GDK_WIN32_FORCE_DCOMP=
+    # usable as an escape hatch if the GPU path ever misbehaves.
+    os.environ.setdefault('GDK_WIN32_FORCE_DCOMP', '1')
+
 sys.path.insert(1, pkgdatadir)
 signal.signal(signal.SIGINT, signal.SIG_DFL)
 

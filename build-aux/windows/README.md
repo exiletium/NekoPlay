@@ -105,32 +105,76 @@ The latter updates only the Win32 environment block, while the C runtime
 hands Python a copy taken at startup; python-mpv looks for `libmpv-2.dll`
 by walking `os.environ['PATH']` and would not see it otherwise.
 
-## Known issue: Direct Composition and the software renderer
+## Direct Composition, and why the app forces it on
 
-On some machines GSK logs this at startup and falls back to
-`GskCairoRenderer`:
+GSK will only present with the GPU once GDK has built a Direct Composition
+device. MSYS2 builds GTK with `003-default-dcomp-off.patch`, which turns
+that into an opt-in:
 
+```c
+-  if (!gdk_has_feature (GDK_FEATURE_DCOMP))
++  if (!gdk_has_feature (GDK_FEATURE_DCOMP) || g_getenv ("GDK_WIN32_FORCE_DCOMP") == NULL)
+     return;
 ```
-Failed to realize renderer 'GskGLRenderer' for surface 'GdkWin32Toplevel':
-OpenGL requires Direct Composition
-```
 
-GTK 4.22 presents both its GL and Vulkan renderers through a Direct
-Composition device, and creates that device from a D3D11 device it makes at
-display-open time. When that does not come together, the only renderer left
-is the software one.
+It returns before `DCompositionCreateDevice` is ever reached, so the device
+stays NULL, GSK refuses **both** its GL and its Vulkan renderer with
+"OpenGL requires Direct Composition", and the whole window — video included
+— is composited by `GskCairoRenderer` in software. Nothing warns about it,
+because nothing failed.
 
-It is not specific to NekoPlay — a five-line GTK4 program reproduces it —
-and it is not fatal. mpv still draws through its own WGL context, so video
-plays; measured against bare `mpv.exe` on the same 4K clip the fallback cost
-about 28% more CPU (41% of one core versus 32%). It is worth knowing about
-because the gap widens with the size of the window being composited.
+So [`src/nekoplay.in`](../../src/nekoplay.in) sets `GDK_WIN32_FORCE_DCOMP=1`,
+and the launcher sets it too. It has to happen **before anything imports
+`gi`**: GDK reads it while its library loads, so setting it from `main.py`,
+after `from gi.repository import Gtk`, is already too late.
 
-To check which renderer you ended up with:
+What it is worth, on a Radeon RX 9060 XT at 1920x1080, playing a 4K60
+60 Mbit/s clip in a maximized window:
+
+| | software (before) | GPU (after) |
+| --- | --- | --- |
+| 4K60 | 87.5% of one core | **~50%** |
+| 1080p60 | 59.9% of one core | **~31%** |
+
+If the GPU path ever misbehaves, `GDK_WIN32_FORCE_DCOMP=` or
+`GDK_DISABLE=dcomp` puts it straight back on the software renderer, and
+`GSK_RENDERER=vulkan` is a third option that also works once the device
+exists. To see which renderer you got:
 
 ```bash
 GSK_DEBUG=renderer nekoplay.exe
 ```
+
+## What still costs more than mpv, and why
+
+Even on the GPU path the player costs roughly 50% of one core on that 4K60
+clip, against 7.7% for bare `mpv --hwdec=d3d11va` and 5.1% for VLC. That gap
+is architectural, not tuning left on the table:
+
+- **The frame copy (~20 points).** libmpv's render API offers only `opengl`
+  and `sw` back ends — there is no D3D11 one. So a decoded D3D11 surface
+  cannot be handed to the compositor the way mpv's own `vo=gpu` does, and
+  every frame takes a GPU→CPU→GPU trip (~12.4 MB/frame at 4K, ~750 MB/s).
+  Every `hwdec` value — `d3d11va`, `dxva2`, `dxinterop`, `auto` — resolves to
+  `d3d11va-copy` in this context; forcing bare mpv down the same
+  `d3d11va-copy` path costs it 26% instead of 7.7%, which prices the copy
+  directly.
+- **Toolkit compositing (~23 points).** The video has to reach a GTK scene
+  graph so the overlay controls can be drawn on top. `Gtk.GraphicsOffload`
+  cannot help here: GTK 4.22 implements `GdkSubsurface` only for Wayland,
+  so offload is a no-op on Win32.
+
+Things measured and found not to matter: every `hwdec` mode, mpv's
+render-quality options (the whole span from `gpu-dumb-mode` to default is
+under 4 points), `GSK_RENDERER=vulkan`, and `Gtk.GraphicsOffload`. Frame
+pacing is already correct — GTK repaints at the video rate, not the
+display's 240 Hz.
+
+The one remaining lever is to stop routing video through the toolkit at all:
+give mpv a native child `HWND` via `--wid` with `vo=gpu-next`, and composite
+the overlay UI separately. That is worth roughly 4x, and would put the player
+near mpv rather than past it — but it is a rewrite of the presentation layer
+and the overlay UI is exactly what it puts at risk.
 
 Note that the app is built against the GUI subsystem and has no console, so
 that output — and any Python traceback — goes to

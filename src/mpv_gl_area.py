@@ -24,6 +24,7 @@ import mpv
 
 from .platform_compat import (
     GL_FRAMEBUFFER_BINDING,
+    RENDER_BLOCK_FOR_TARGET_TIME,
     get_display_param,
     gl_get_integerv,
     gl_get_proc_address,
@@ -75,6 +76,7 @@ class BaseGLArea(Gtk.GLArea):
             assert self._ctx is not None
             self._ctx.render(
                 flip_y=True,
+                block_for_target_time=RENDER_BLOCK_FOR_TARGET_TIME,
                 opengl_fbo={
                     "w": self.get_width() * self.props.scale_factor,
                     "h": self.get_height() * self.props.scale_factor,

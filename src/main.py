@@ -47,9 +47,9 @@ if not IS_WINDOWS:
     # Set the icon shown in gnome sound settings
     os.environ["PIPEWIRE_PROPS"] = '{application.icon-name="moe.nyarchlinux.nekoplay"}'
 
-# On Windows GDK already prefers GL and falls back on its own, so pinning a
-# renderer here would only stop it reaching for Vulkan when GL is refused.
-# See build-aux/windows/README.md on Direct Composition.
+# Note: GDK_WIN32_FORCE_DCOMP cannot be set from here - importing
+# gi.repository.Gtk above has already loaded GDK. It is set in nekoplay.in,
+# before anything touches gi. See the comment there.
 
 
 class CineApplication(Adw.Application):

@@ -171,6 +171,14 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE previous, PWSTR cmdline,
      * loudly if it is handed anything else. */
     set_env(L"LC_NUMERIC", L"C");
 
+    /* GSK will only present with the GPU once it has a Direct Composition
+     * device, and the MSYS2 build of GTK makes building one opt-in. Without
+     * this the whole window falls back to the software renderer, which
+     * costs about 70% more CPU on 4K60. An existing value wins, so setting
+     * GDK_WIN32_FORCE_DCOMP= by hand still forces the old behaviour back. */
+    if (!_wgetenv(L"GDK_WIN32_FORCE_DCOMP"))
+        set_env(L"GDK_WIN32_FORCE_DCOMP", L"1");
+
     python = load_python();
     if (!python) {
         fail(L"Could not load the bundled Python runtime.\n\n"
