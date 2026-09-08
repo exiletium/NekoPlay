@@ -44,6 +44,7 @@ from .options import OptionsMenuButton
 from .platform_compat import (
     AUTOCREATE_PLAYLIST,
     MPV_PATH_SEP,
+    round_window_corners,
     inhibit_idle,
     is_document_portal_path,
     uninhibit_idle,
@@ -301,6 +302,9 @@ class CineWindow(Adw.ApplicationWindow):
 
         if settings.get_boolean("save-session") and is_activate:
             restore_last_playlist(self, self.app, self.mpv)
+
+        # Needs the native window, which only exists once realized.
+        self.connect("realize", lambda w: round_window_corners(w))
 
     def _setup_actions(self):
         self._create_action("clear-and-add", self._on_clear_and_add)

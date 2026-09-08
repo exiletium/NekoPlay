@@ -220,6 +220,58 @@ def get_display_param() -> dict:
     return param
 
 
+# --- Window corners --------------------------------------------------------
+
+if IS_WINDOWS:
+    _DWMWA_WINDOW_CORNER_PREFERENCE = 33
+    _DWMWCP_ROUND = 2
+
+    def round_window_corners(window) -> None:
+        """Ask the compositor to round this window's corners.
+
+        On Linux GTK draws the rounded corners itself and relies on the
+        toplevel's alpha channel to hide everything outside them. Windows
+        toplevels have no alpha, so that radius has to go or it leaves black
+        wedges in the corners - and DWM does not round a borderless
+        client-side-decorated window of its own accord. Asking it directly
+        gives the rounding back, drawn by the compositor rather than by GTK.
+        """
+        try:
+            surface = window.get_surface()
+            if surface is None:
+                return
+
+            gtk = ctypes.CDLL("libgtk-4-1.dll")
+            gtk.gdk_win32_surface_get_handle.restype = ctypes.c_void_p
+            gtk.gdk_win32_surface_get_handle.argtypes = [ctypes.c_void_p]
+
+            ctypes.pythonapi.PyCapsule_GetPointer.restype = ctypes.c_void_p
+            ctypes.pythonapi.PyCapsule_GetPointer.argtypes = (ctypes.py_object,)
+            ptr = ctypes.pythonapi.PyCapsule_GetPointer(surface.__gpointer__, None)
+
+            hwnd = gtk.gdk_win32_surface_get_handle(ptr)
+            if not hwnd:
+                return
+
+            dwm = ctypes.WinDLL("dwmapi.dll")
+            preference = ctypes.c_int(_DWMWCP_ROUND)
+            dwm.DwmSetWindowAttribute(
+                ctypes.c_void_p(hwnd),
+                _DWMWA_WINDOW_CORNER_PREFERENCE,
+                ctypes.byref(preference),
+                ctypes.sizeof(preference),
+            )
+        except Exception:
+            # Rounded corners only exist from Windows 11 on; older versions
+            # return an error and simply keep square ones.
+            logger.exception("round_window_corners failed")
+
+else:
+
+    def round_window_corners(window) -> None:
+        """The window manager handles this everywhere else."""
+
+
 # --- Idle inhibition -------------------------------------------------------
 
 if IS_WINDOWS:
