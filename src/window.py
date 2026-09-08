@@ -43,8 +43,6 @@ from .mpv_gl_area import ThumbPreviewGLArea, VideoGLArea
 from .options import OptionsMenuButton
 from .platform_compat import (
     AUTOCREATE_PLAYLIST,
-    DEFAULT_OSD_FONT,
-    DEFAULT_SUB_FONT,
     MPV_PATH_SEP,
     inhibit_idle,
     is_document_portal_path,
@@ -231,8 +229,8 @@ class CineWindow(Adw.ApplicationWindow):
             sub_shadow_color="#97000000",
             sub_color="#ebebeb",
             sub_use_margins=False,
-            sub_font=DEFAULT_SUB_FONT,
-            osd_font=DEFAULT_OSD_FONT,
+            sub_font="Adwaita Sans SemiBold",
+            osd_font="Adwaita Sans",
             osd_bold=True,
             osd_bar=False,
             osd_blur=1,

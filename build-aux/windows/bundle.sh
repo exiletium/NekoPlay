@@ -180,6 +180,50 @@ cp -r "$PREFIX/share/icons/Adwaita" "$DIST/share/icons/"
 say "Copying fontconfig configuration"
 cp -r "$PREFIX/etc/fonts" "$DIST/etc/"
 
+say "Fetching Adwaita fonts"
+# The UI asks for Adwaita Sans by name. Windows has no such font and MSYS2
+# packages none, so without this fontconfig substitutes something arbitrary:
+# the interface renders in the wrong face and glyphs the substitute lacks,
+# the ellipsis in "Open..." among them, come out as tofu.
+ADW_URL="https://gitlab.gnome.org/GNOME/adwaita-fonts/-/archive/51.0/adwaita-fonts-51.0.tar.gz"
+ADW_SHA="d9d23a83ed9a6b3a28aad520c681effaf22522fbe4a8768482b8bf6dd664bd19"
+FONT_DIR="$DIST/share/fonts/adwaita"
+mkdir -p "$FONT_DIR"
+tmp="$(mktemp -d)"
+curl -fsSL "$ADW_URL" -o "$tmp/adwaita-fonts.tar.gz"
+echo "$ADW_SHA  $tmp/adwaita-fonts.tar.gz" | sha256sum -c -
+tar -C "$tmp" -xzf "$tmp/adwaita-fonts.tar.gz"
+find "$tmp" -name '*.ttf' -exec cp {} "$FONT_DIR/" \;
+rm -rf "$tmp"
+say "  $(ls "$FONT_DIR" | wc -l) font files"
+
+# fonts.conf already pulls in conf.d relative to itself, so a drop-in is
+# enough. prefix="relative" resolves against this file's own directory,
+# which keeps the bundle movable.
+cat > "$DIST/etc/fonts/conf.d/99-nekoplay-fonts.conf" <<'FONTCONF'
+<?xml version="1.0"?>
+<!DOCTYPE fontconfig SYSTEM "urn:fontconfig:fonts.dtd">
+<fontconfig>
+  <!-- Adwaita Sans/Mono shipped inside the application folder. -->
+  <dir>APPSHAREFONTDIR</dir>
+
+  <!-- GTK asks for "Adwaita Sans Text", which is not a real family: it only
+       exists as a generic alias in fontconfig's own latin rules and binds to
+       whatever sans-serif wins. Point it at the font actually shipped here. -->
+  <match target="pattern">
+    <test qual="any" name="family"><string>Adwaita Sans Text</string></test>
+    <edit name="family" mode="prepend" binding="strong"><string>Adwaita Sans</string></edit>
+  </match>
+</fontconfig>
+FONTCONF'
+<?xml version="1.0"?>
+<!DOCTYPE fontconfig SYSTEM "urn:fontconfig:fonts.dtd">
+<fontconfig>
+  <!-- Adwaita Sans/Mono shipped inside the application folder. -->
+  <dir prefix="relative">../../../share/fonts</dir>
+</fontconfig>
+FONTCONF
+
 # --- Anime4K ---------------------------------------------------------------
 
 if [ "$WITH_ANIME4K" = 1 ]; then

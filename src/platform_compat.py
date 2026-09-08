@@ -41,11 +41,6 @@ MPV_PATH_SEP = ";" if IS_WINDOWS else ":"
 # among vendor-named folders would be a mystery.
 CONFIG_DIR_NAME = "NekoPlay" if IS_WINDOWS else "cine"
 
-# Adwaita Sans is part of the GNOME runtime and is not packaged for Windows,
-# so fall back to a face that ships with the OS.
-DEFAULT_SUB_FONT = "Segoe UI Semibold" if IS_WINDOWS else "Adwaita Sans SemiBold"
-DEFAULT_OSD_FONT = "Segoe UI" if IS_WINDOWS else "Adwaita Sans"
-
 # Keeps a console window from flashing up when we shell out to ffprobe.
 SUBPROCESS_FLAGS = 0x08000000 if IS_WINDOWS else 0  # CREATE_NO_WINDOW
 
