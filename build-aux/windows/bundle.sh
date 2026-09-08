@@ -198,8 +198,7 @@ rm -rf "$tmp"
 say "  $(ls "$FONT_DIR" | wc -l) font files"
 
 # fonts.conf already pulls in conf.d relative to itself, so a drop-in is
-# enough. prefix="relative" resolves against this file's own directory,
-# which keeps the bundle movable.
+# enough.
 cat > "$DIST/etc/fonts/conf.d/99-nekoplay-fonts.conf" <<'FONTCONF'
 <?xml version="1.0"?>
 <!DOCTYPE fontconfig SYSTEM "urn:fontconfig:fonts.dtd">
@@ -214,13 +213,6 @@ cat > "$DIST/etc/fonts/conf.d/99-nekoplay-fonts.conf" <<'FONTCONF'
     <test qual="any" name="family"><string>Adwaita Sans Text</string></test>
     <edit name="family" mode="prepend" binding="strong"><string>Adwaita Sans</string></edit>
   </match>
-</fontconfig>
-FONTCONF'
-<?xml version="1.0"?>
-<!DOCTYPE fontconfig SYSTEM "urn:fontconfig:fonts.dtd">
-<fontconfig>
-  <!-- Adwaita Sans/Mono shipped inside the application folder. -->
-  <dir prefix="relative">../../../share/fonts</dir>
 </fontconfig>
 FONTCONF
 
