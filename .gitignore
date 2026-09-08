@@ -10,3 +10,5 @@ repo
 moe.nyarchlinux.nekoplay.flatpak
 _install
 dist
+__pycache__/
+*.pyc
