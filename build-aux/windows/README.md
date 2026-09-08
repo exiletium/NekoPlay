@@ -170,11 +170,42 @@ under 4 points), `GSK_RENDERER=vulkan`, and `Gtk.GraphicsOffload`. Frame
 pacing is already correct — GTK repaints at the video rate, not the
 display's 240 Hz.
 
+## The child-HWND option, and what it would cost
+
 The one remaining lever is to stop routing video through the toolkit at all:
-give mpv a native child `HWND` via `--wid` with `vo=gpu-next`, and composite
-the overlay UI separately. That is worth roughly 4x, and would put the player
-near mpv rather than past it — but it is a rewrite of the presentation layer
-and the overlay UI is exactly what it puts at risk.
+give mpv a native child `HWND` via `--wid` with `vo=gpu-next`. That was
+spiked — [`spike-child-hwnd.py`](spike-child-hwnd.py) is the experiment, kept
+runnable — and it works, dramatically:
+
+| | shipping GLArea path | child HWND |
+| --- | --- | --- |
+| CPU, 4K60 | ~50% of one core | **7.5–10.6%** |
+| hwdec | `d3d11va-copy` (forced) | **`d3d11va`, zero copy** |
+| frames | 60fps, 0 drops | 60fps, 0 drops |
+
+That is parity with bare mpv (7.7%). Resize and maximize behave, and mouse
+input turns out to be free: a `STATIC` child reports `HTTRANSPARENT`, so
+clicks fall straight through to GTK — verified for both a click over the
+video and one on the controls.
+
+**What it breaks is the reason it has not been adopted.** A Win32 child
+window paints above its parent's client area, so every piece of GTK content
+under it disappears — the auto-hiding controls and the CSD headerbar both
+vanish, leaving nothing but video. Reserving a strip outside the child brings
+the controls back (`SPIKE_INSET=1` demonstrates it) but they can no longer
+float *on* the picture, which is the design the player is built around.
+
+Keeping the current look would need one of:
+
+- a second layered, always-on-top window holding the controls, kept in sync
+  with the main window on move, resize, z-order and fullscreen; or
+- mpv's swapchain placed in a DirectComposition visual *beneath* GTK's own
+  content. GTK does have a DComp device now, but its visual tree is not
+  public API.
+
+So it is a ~5x win in exchange for rebuilding the presentation layer and
+either changing the UI design or taking on a second window to babysit. Worth
+doing deliberately, not as a tuning pass.
 
 Note that the app is built against the GUI subsystem and has no console, so
 that output — and any Python traceback — goes to
