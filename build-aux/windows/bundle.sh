@@ -203,8 +203,10 @@ cat > "$DIST/etc/fonts/conf.d/99-nekoplay-fonts.conf" <<'FONTCONF'
 <?xml version="1.0"?>
 <!DOCTYPE fontconfig SYSTEM "urn:fontconfig:fonts.dtd">
 <fontconfig>
-  <!-- Adwaita Sans/Mono shipped inside the application folder. -->
-  <dir>APPSHAREFONTDIR</dir>
+  <!-- The font files themselves are registered at startup by nekoplay.in,
+       via FcConfigAppFontAddDir: APPSHAREFONTDIR resolves one directory too
+       high for this layout, and a <dir> cannot be written relative to a
+       folder the user may move. -->
 
   <!-- GTK asks for "Adwaita Sans Text", which is not a real family: it only
        exists as a generic alias in fontconfig's own latin rules and binds to

@@ -28,10 +28,11 @@ from typing import cast
 import gi
 
 gi.require_version("Adw", "1")
+gi.require_version("Gdk", "4.0")
 gi.require_version("Gio", "2.0")
 gi.require_version("GLib", "2.0")
 gi.require_version("Gtk", "4.0")
-from gi.repository import Adw, Gio, GLib, Gtk
+from gi.repository import Adw, Gdk, Gio, GLib, Gtk
 
 from .mpris import MPRIS
 from .platform_compat import IS_WINDOWS, SUBPROCESS_FLAGS
@@ -73,10 +74,37 @@ class CineApplication(Adw.Application):
 
         self.connect("shutdown", self._on_shutdown)
 
+    # GTK reserves a margin around a client-side-decorated window for its drop
+    # shadow, and expects the toplevel to have an alpha channel so the margin
+    # stays invisible. Windows toplevels do not get one, so that margin paints
+    # solid black and the window sits inside a thick black frame. Dropping the
+    # shadow and the rounded corners removes it; Windows 11 rounds window
+    # corners itself, so the result still looks right.
+    WINDOWS_CSS = b"""
+    window.csd {
+      box-shadow: none;
+      margin: -12px;
+      border-radius: 0;
+    }
+
+    window.csd:backdrop {
+      box-shadow: none;
+    }
+    """
+
     def do_startup(self):
         self.mpris = MPRIS(self)
 
         Adw.Application.do_startup(self)
+
+        if IS_WINDOWS:
+            provider = Gtk.CssProvider()
+            provider.load_from_data(self.WINDOWS_CSS)
+            Gtk.StyleContext.add_provider_for_display(
+                Gdk.Display.get_default(),
+                provider,
+                Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION + 1,
+            )
         Adw.StyleManager.get_default().props.color_scheme = Adw.ColorScheme.FORCE_DARK
 
         self._create_action("new-window", lambda *a: self.activate(), ["<primary>n"])

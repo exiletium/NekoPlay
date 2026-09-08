@@ -91,6 +91,14 @@ if os.name == 'nt':
     # needs this variable.
     os.environ.pop('XDG_DATA_DIRS', None)
 
+    # Pango has two backends on Windows. The default, pangowin32, matches
+    # fonts through GDI, which never looks at fontconfig and has poor support
+    # for variable fonts - Adwaita Sans is one, so GDI substitutes a face that
+    # is missing glyphs the real font has. Selecting the fontconfig backend
+    # makes Pango use the same matcher that already resolves the name
+    # correctly. It is read when Pango loads, so it has to be set here.
+    os.environ.setdefault('PANGOCAIRO_BACKEND', 'fc')
+
     def _add_bundled_fonts():
         """Make the Adwaita fonts shipped in the bundle usable by the UI.
 
@@ -189,6 +197,21 @@ def bind_locale():
     textdomain = entry('libintl_textdomain', 'textdomain')
     textdomain.argtypes = [ctypes.c_char_p]
     textdomain(b'cine')
+
+    # gettext hands back each translation re-encoded in the locale's
+    # codeset, and on Windows that is a legacy code page - here
+    # 'English_United Kingdom.1252'. The catalogues are UTF-8, so
+    # "Open…" came out of the .mo as 'Open' followed by the single byte
+    # 0x85, CP1252's ellipsis. GTK reads every string as UTF-8, 0x85 is
+    # not valid UTF-8 on its own, and Pango draws bytes it cannot decode
+    # as a hex box - which is the tofu on the start page's Open button.
+    # Nothing else in the UI showed it because every other translated
+    # string on screen is plain ASCII. GTK does this for its own
+    # catalogues in gtk_init; ours has to ask for itself.
+    bind_codeset = entry('libintl_bind_textdomain_codeset',
+                         'bind_textdomain_codeset')
+    bind_codeset.argtypes = [ctypes.c_char_p, ctypes.c_char_p]
+    bind_codeset(b'cine', b'UTF-8')
 
 
 try:
