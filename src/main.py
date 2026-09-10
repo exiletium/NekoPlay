@@ -84,6 +84,7 @@ class CineApplication(Adw.Application):
     window.csd {
       box-shadow: none;
       margin: -12px;
+      border: none;
       border-radius: 0;
     }
 

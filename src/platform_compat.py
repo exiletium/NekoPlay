@@ -224,10 +224,12 @@ def get_display_param() -> dict:
 
 if IS_WINDOWS:
     _DWMWA_WINDOW_CORNER_PREFERENCE = 33
+    _DWMWA_BORDER_COLOR = 34
     _DWMWCP_ROUND = 2
+    _DWMWA_COLOR_NONE = 0xFFFFFFFE
 
     def round_window_corners(window) -> None:
-        """Ask the compositor to round this window's corners.
+        """Round this window's corners, and drop the frame DWM draws round it.
 
         On Linux GTK draws the rounded corners itself and relies on the
         toplevel's alpha channel to hide everything outside them. Windows
@@ -254,13 +256,17 @@ if IS_WINDOWS:
                 return
 
             dwm = ctypes.WinDLL("dwmapi.dll")
-            preference = ctypes.c_int(_DWMWCP_ROUND)
-            dwm.DwmSetWindowAttribute(
-                ctypes.c_void_p(hwnd),
-                _DWMWA_WINDOW_CORNER_PREFERENCE,
-                ctypes.byref(preference),
-                ctypes.sizeof(preference),
-            )
+            for attribute, value in (
+                (_DWMWA_WINDOW_CORNER_PREFERENCE, _DWMWCP_ROUND),
+                (_DWMWA_BORDER_COLOR, _DWMWA_COLOR_NONE),
+            ):
+                setting = ctypes.c_uint(value)
+                dwm.DwmSetWindowAttribute(
+                    ctypes.c_void_p(hwnd),
+                    attribute,
+                    ctypes.byref(setting),
+                    ctypes.sizeof(setting),
+                )
         except Exception:
             # Rounded corners only exist from Windows 11 on; older versions
             # return an error and simply keep square ones.
