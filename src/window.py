@@ -1842,6 +1842,7 @@ class CineWindow(Adw.ApplicationWindow):
 
         @self.mpv.event_callback("file-loaded")
         def on_file_loaded(_event):
+            trace("file loaded")
             idle_add_once(on_f_loaded)
             timeout_add_seconds_once(5, setattr, self, "_error_count", 0)
 

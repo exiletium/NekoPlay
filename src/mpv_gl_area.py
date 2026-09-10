@@ -28,7 +28,6 @@ from .platform_compat import (
     get_display_param,
     gl_get_integerv,
     gl_get_proc_address,
-    TRACE,
     trace,
 )
 
@@ -46,7 +45,6 @@ class BaseGLArea(Gtk.GLArea):
         super().__init__(**kwargs)
         self._ctx: mpv.MpvRenderContext | None = None
         self._mpv: mpv.MPV | None = None
-        self._had_frame = False
         self._fbo = ctypes.c_int()
         self.connect("realize", self._on_realize)
         self.connect("render", self._on_render)
@@ -71,19 +69,11 @@ class BaseGLArea(Gtk.GLArea):
     def _on_mpv_update(self):
         """mpv has a frame for us, so ask for a redraw.
 
-        Under NEKOPLAY_TRACE this also reports the first real frame, which
-        is the end of startup as a user experiences it. The callback fires
-        once when the render context is created too, before any file is
-        loaded, so it has to check that the core is actually playing - the
-        synchronous read that needs is why this is behind the flag.
+        This runs on a thread of mpv's choosing while the core may be holding
+        its locks, so it must not call back into mpv - a property read from
+        here deadlocks against a property write on the main thread. Nothing
+        but the redraw request belongs here.
         """
-        if TRACE and not self._had_frame:
-            try:
-                if self._mpv is not None and self._mpv.core_idle is False:
-                    self._had_frame = True
-                    trace("first frame from mpv")
-            except Exception:
-                pass
         GLib.idle_add(
             self.queue_render,
             priority=GLib.PRIORITY_HIGH_IDLE,  # type: ignore
