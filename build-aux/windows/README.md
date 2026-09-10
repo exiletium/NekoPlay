@@ -46,6 +46,11 @@ Drop `--with-anime4k` to skip fetching the shaders; the build then needs no
 network. The archive is pinned to the same release and SHA256 as the Flatpak
 manifest.
 
+`--with-video2x=DIR` copies a video2x_optimized portable bundle (the folder
+holding `video2x.bat`) into the app, so AI upscaling works with no setup. It
+adds ~270 MB; without it the feature works from a folder the user picks in
+Preferences. See "AI upscaling and interpolation" below.
+
 ## The installer
 
 [`nekoplay.nsi`](nekoplay.nsi) packs the same folder into a per-machine
@@ -145,6 +150,53 @@ exists. To see which renderer you got:
 GSK_DEBUG=renderer nekoplay.exe
 ```
 
+## AI upscaling and interpolation (video2x)
+
+Preferences and the in-player options panel carry an **AI Render** setting:
+Off, Upscale ×4 (Real-ESRGAN), Interpolate 2× or 4× (RIFE v4.26). It runs
+video2x_optimized, the GPU-resident ONNX Runtime pipeline, as a subprocess;
+it is never imported into the app, because it needs its own Python with
+onnxruntime-directml. The app looks for it in `share/cine/video2x`
+(bundled), then in the folder set in Preferences, and uses the bundle's own
+interpreter if there is one, otherwise the first system Python that can
+`import onnxruntime` (the Microsoft Store alias is skipped). ffmpeg has to be
+on PATH or in the install's `bin\`.
+
+The render is joined to playback through an mpv `on_load` hook
+(`video2x.lua`), the same mechanism ytdl_hook uses: the hook changes
+`stream-open-filename`, so mpv keeps reporting the original path, title and
+playlist entry - and the watch history, resume position and external
+subtitles all follow the original - while the bytes come from the render.
+
+Two timings, in Preferences under **AI Render Timing**:
+
+- **Pre-render** keeps the load deferred until the whole file is rendered,
+  with a progress toast that can cancel; cancelling plays the original.
+  Full quality and full seeking.
+- **Live** opens the output once ~4 s of it exist and plays it as it grows.
+  When the render is slower than playback the player pauses with
+  "Rendering ahead…" on the OSD and continues once the render is 4 s ahead
+  again, like buffering a stream. Seeking beyond what has been rendered
+  waits in the same way. Two things make this work: mpv follows a growing
+  file as long as it never reads to the end (`--stream` makes the muxer
+  flush every second), and if it does hit EOF, a seek to the same position
+  makes the demuxer look again.
+
+Measured on a 608×1080 30 fps clip on an RX 9060 XT: interpolate 2× runs at
+4.0× realtime, upscale ×4 (to 2432×4320) at 0.88× - so live upscaling of
+that clip pauses roughly once to catch up.
+
+Renders are cached under `%LOCALAPPDATA%\NekoPlay\video2x`, keyed by the
+source file, its size and mtime, and the mode; the cache size and a Clear
+button are in Preferences. Engines are per-resolution ONNX files: a missing
+one is built on the spot if the install's Python has PyTorch (seconds for
+the upscaler, a minute or two for RIFE); otherwise the original plays and a
+toast says why. Videos with rotation metadata are played unrendered, because
+the pipeline's decoder would autorotate them into the wrong shape. A render
+left running when the window closes is killed with everything it spawned -
+a Windows Job Object flagged kill-on-close, so this holds even if the app
+dies.
+
 ## What still costs more than mpv, and why
 
 Even on the GPU path the player costs roughly 50% of one core on that 4K60
@@ -169,20 +221,6 @@ render-quality options (the whole span from `gpu-dumb-mode` to default is
 under 4 points), `GSK_RENDERER=vulkan`, and `Gtk.GraphicsOffload`. Frame
 pacing is already correct — GTK repaints at the video rate, not the
 display's 240 Hz.
-
-## Why it still costs more than mpv
-
-Even on the GPU path the player costs roughly 50% of one core on that 4K60
-clip, against 7.7% for bare `mpv --hwdec=d3d11va`. That gap is architectural
-rather than tuning left undone:
-
-- **The frame copy (~20 points).** libmpv's render API offers only `opengl`
-  and `sw` back ends - there is no D3D11 one - so a decoded D3D11 surface
-  cannot be handed to the compositor the way mpv's own `vo=gpu` does. Forcing
-  bare mpv down the same `d3d11va-copy` path costs it 26% instead of 7.7%,
-  which prices the copy directly.
-- **Toolkit compositing (~23 points).** The video has to reach a GTK scene
-  graph so the overlay controls can be drawn on top of it.
 
 Closing either one means taking the video out of GTK entirely - handing mpv
 its own native window - which is a different player with a different UI. That

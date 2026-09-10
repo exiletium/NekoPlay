@@ -37,6 +37,7 @@ gi.require_version("GObject", "2.0")
 from gi.repository import Adw, Gdk, Gio, GLib, GObject, Gtk
 
 from .anime4k import apply_anime4k_shaders
+from .video2x import Video2X
 from .history import HistoryDialog
 from .mpris import MPRIS
 from .mpv_gl_area import ThumbPreviewGLArea, VideoGLArea
@@ -289,6 +290,7 @@ class CineWindow(Adw.ApplicationWindow):
         self._setup_actions()
         self._setup_widgets()
         self._setup_observers()
+        self.video2x = Video2X(self, settings)
 
         try:
             self.mpv.command("load-input-conf", f"memory://{INTERNAL_BINDINGS}")
@@ -1768,6 +1770,8 @@ class CineWindow(Adw.ApplicationWindow):
             timeout_add_once(350, self.revealer_icon_indicator.set_reveal_child, False)
 
     def do_close_request(self) -> bool:
+        # A render still going is for a playback that is about to end.
+        self.video2x.cancel_all()
         try:
             same_playlist = is_same_playlist(self.mpv.playlist)
             save_pos = settings.get_boolean("save-video-position")

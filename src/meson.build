@@ -96,7 +96,12 @@ cine_sources = [
   'save_session.py',
   'shortcuts.py',
   'utils.py',
+  'video2x.py',
   'window.py',
 ]
 
 install_data(cine_sources, install_dir: moduledir)
+
+# Loaded into mpv by video2x.py, which looks for it one level above the
+# package, next to the shaders.
+install_data('video2x.lua', install_dir: pkgdatadir)

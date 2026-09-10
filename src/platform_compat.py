@@ -27,6 +27,7 @@ app never has to ask which one it is running on.
 import ctypes
 import logging
 import os
+import subprocess
 
 logger = logging.getLogger(__name__)
 
@@ -377,3 +378,122 @@ def trace(label: str) -> None:
     import time
 
     print("[trace] %7.1f ms  %s" % ((time.perf_counter() - _T0) * 1000, label))
+
+
+# --- Process trees ---------------------------------------------------------
+#
+# video2x runs its decoder and encoder in child processes of its own, plus
+# two ffmpegs. Killing the Python that started them leaves all of that
+# running - still holding the output file, still burning the GPU, and still
+# holding the stdout pipe open so the reader never sees EOF. What is wanted
+# is "everything this command started, gone", including when this process
+# itself goes away without asking.
+
+
+class ProcessTree:
+    """A subprocess whose whole tree dies when asked, or when we do.
+
+    On Windows the child goes into a Job Object flagged to kill its members
+    when the last handle to it closes; descendants inherit the job, and the
+    handle lives as long as this object - or this process. Elsewhere the
+    child leads a new session, and the whole process group gets the signal.
+    """
+
+    def __init__(self, cmd, **kwargs):
+        self._job = None
+        if IS_WINDOWS:
+            self.proc = subprocess.Popen(cmd, **kwargs)
+            self._job = self._make_job()
+            if self._job:
+                k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+                k32.AssignProcessToJobObject.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+                if not k32.AssignProcessToJobObject(self._job, int(self.proc._handle)):
+                    logger.warning(
+                        "AssignProcessToJobObject failed (%d)", ctypes.get_last_error()
+                    )
+        else:
+            kwargs.setdefault("start_new_session", True)
+            self.proc = subprocess.Popen(cmd, **kwargs)
+
+    @staticmethod
+    def _make_job():
+        JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = 0x2000
+        JobObjectExtendedLimitInformation = 9
+
+        class IO_COUNTERS(ctypes.Structure):
+            _fields_ = [(n, ctypes.c_ulonglong) for n in (
+                "ReadOperationCount", "WriteOperationCount", "OtherOperationCount",
+                "ReadTransferCount", "WriteTransferCount", "OtherTransferCount",
+            )]
+
+        class JOBOBJECT_BASIC_LIMIT_INFORMATION(ctypes.Structure):
+            _fields_ = [
+                ("PerProcessUserTimeLimit", ctypes.c_longlong),
+                ("PerJobUserTimeLimit", ctypes.c_longlong),
+                ("LimitFlags", ctypes.c_uint32),
+                ("MinimumWorkingSetSize", ctypes.c_size_t),
+                ("MaximumWorkingSetSize", ctypes.c_size_t),
+                ("ActiveProcessLimit", ctypes.c_uint32),
+                ("Affinity", ctypes.c_size_t),
+                ("PriorityClass", ctypes.c_uint32),
+                ("SchedulingClass", ctypes.c_uint32),
+            ]
+
+        class JOBOBJECT_EXTENDED_LIMIT_INFORMATION(ctypes.Structure):
+            _fields_ = [
+                ("BasicLimitInformation", JOBOBJECT_BASIC_LIMIT_INFORMATION),
+                ("IoInfo", IO_COUNTERS),
+                ("ProcessMemoryLimit", ctypes.c_size_t),
+                ("JobMemoryLimit", ctypes.c_size_t),
+                ("PeakProcessMemoryUsed", ctypes.c_size_t),
+                ("PeakJobMemoryUsed", ctypes.c_size_t),
+            ]
+
+        try:
+            k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+            k32.CreateJobObjectW.restype = ctypes.c_void_p
+            k32.CreateJobObjectW.argtypes = [ctypes.c_void_p, ctypes.c_wchar_p]
+            k32.SetInformationJobObject.argtypes = [
+                ctypes.c_void_p, ctypes.c_int, ctypes.c_void_p, ctypes.c_uint32,
+            ]
+            job = k32.CreateJobObjectW(None, None)
+            if not job:
+                return None
+            info = JOBOBJECT_EXTENDED_LIMIT_INFORMATION()
+            info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+            if not k32.SetInformationJobObject(
+                job, JobObjectExtendedLimitInformation, ctypes.byref(info), ctypes.sizeof(info)
+            ):
+                logger.warning("SetInformationJobObject failed (%d)", ctypes.get_last_error())
+            return job
+        except Exception:
+            logger.exception("Could not create a job object")
+            return None
+
+    def kill(self) -> None:
+        """Terminate the process and everything it started."""
+        if IS_WINDOWS:
+            if self._job:
+                k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+                k32.TerminateJobObject.argtypes = [ctypes.c_void_p, ctypes.c_uint32]
+                k32.TerminateJobObject(self._job, 1)
+            try:
+                self.proc.kill()
+            except OSError:
+                pass
+        else:
+            import signal
+
+            try:
+                os.killpg(self.proc.pid, signal.SIGKILL)
+            except OSError:
+                try:
+                    self.proc.kill()
+                except OSError:
+                    pass
+
+    def close(self) -> None:
+        """Let go of the job once the tree has exited on its own."""
+        if self._job:
+            ctypes.WinDLL("kernel32").CloseHandle(self._job)
+            self._job = None

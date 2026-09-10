@@ -23,9 +23,13 @@ DIST="${DIST:-$SRC_ROOT/dist/NekoPlay}"
 PYVER="$(python -c 'import sys; print("%d.%d" % sys.version_info[:2])')"
 
 WITH_ANIME4K=0
+WITH_VIDEO2X=""
 for arg in "$@"; do
 	case "$arg" in
 	--with-anime4k) WITH_ANIME4K=1 ;;
+	# A video2x_optimized portable bundle (the folder holding video2x.bat)
+	# to ship inside the app, so AI upscaling works without any setup.
+	--with-video2x=*) WITH_VIDEO2X="${arg#--with-video2x=}" ;;
 	*)
 		echo "unknown option: $arg" >&2
 		exit 2
@@ -236,6 +240,33 @@ if [ "$WITH_ANIME4K" = 1 ]; then
 	say "  $(find "$DIST/share/cine/shaders" -name '*.glsl' | wc -l) shaders"
 else
 	echo "  skipping Anime4K shaders (pass --with-anime4k to include them)"
+fi
+
+# --- video2x_optimized ------------------------------------------------------
+#
+# Optional, and large (~170 MB plus ~100 MB of engines): the portable bundle
+# of video2x_optimized, copied to where video2x.py looks first. Without it
+# the feature still works from a folder the user points to in Preferences.
+
+if [ -n "$WITH_VIDEO2X" ]; then
+	if [ ! -f "$WITH_VIDEO2X/video2x_opt/cli.py" ]; then
+		echo "no video2x_optimized at $WITH_VIDEO2X (expected video2x_opt/cli.py)" >&2
+		exit 1
+	fi
+	say "Copying video2x_optimized"
+	mkdir -p "$DIST/share/cine/video2x"
+	# Everything the runtime needs; not the docs, the benchmarks or the
+	# demo clip, and never the source checkout's build leftovers.
+	for item in python lib video2x_opt models bin video2x.bat README.txt requirements.txt; do
+		[ -e "$WITH_VIDEO2X/$item" ] && cp -r "$WITH_VIDEO2X/$item" "$DIST/share/cine/video2x/"
+	done
+	find "$DIST/share/cine/video2x" -name '__pycache__' -type d -exec rm -rf {} + 2>/dev/null || true
+	if [ ! -x "$DIST/share/cine/video2x/python/python.exe" ]; then
+		echo "  note: no bundled interpreter; a system Python with onnxruntime will be used"
+	fi
+	say "  $(du -sh "$DIST/share/cine/video2x" | cut -f1), $(ls "$DIST/share/cine/video2x/models"/*.onnx 2>/dev/null | wc -l) engines"
+else
+	echo "  skipping video2x_optimized (pass --with-video2x=DIR to bundle it)"
 fi
 
 # --- finish ----------------------------------------------------------------

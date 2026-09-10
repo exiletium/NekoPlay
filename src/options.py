@@ -24,6 +24,7 @@ from typing import cast
 
 import gi
 
+from . import video2x
 from .anime4k import (
     MODE_INDEX_MAP,
     MODE_TO_INDEX,
@@ -78,6 +79,8 @@ class OptionsMenuButton(Gtk.MenuButton):
     crop_dropdown: Gtk.DropDown = Gtk.Template.Child()
     crop_list: Gtk.StringList = Gtk.Template.Child()
     upscale_dropdown: Gtk.DropDown = Gtk.Template.Child()
+    video2x_mode_dropdown: Gtk.DropDown = Gtk.Template.Child()
+    video2x_render_dropdown: Gtk.DropDown = Gtk.Template.Child()
     zoom_spin: Gtk.SpinButton = Gtk.Template.Child()
     contrast_spin: Gtk.SpinButton = Gtk.Template.Child()
     brightness_spin: Gtk.SpinButton = Gtk.Template.Child()
@@ -221,6 +224,14 @@ class OptionsMenuButton(Gtk.MenuButton):
         if self.upscale_dropdown.get_selected() != upscale_idx:
             self.upscale_dropdown.set_selected(upscale_idx)
 
+        v2x = self._win.video2x
+        mode_idx = video2x.MODE_TO_INDEX.get(v2x.mode, 0)
+        if self.video2x_mode_dropdown.get_selected() != mode_idx:
+            self.video2x_mode_dropdown.set_selected(mode_idx)
+        render_idx = video2x.RENDER_TO_INDEX.get(v2x.render, 0)
+        if self.video2x_render_dropdown.get_selected() != render_idx:
+            self.video2x_render_dropdown.set_selected(render_idx)
+
     @Gtk.Template.Callback()
     def _on_reset_all_options(self, _btn):
         self.aspect_dropdown.set_selected(0)
@@ -228,6 +239,7 @@ class OptionsMenuButton(Gtk.MenuButton):
         self._on_rotate_reset(None)
         self._on_flip_reset(None)
         self.upscale_dropdown.set_selected(0)
+        self.video2x_mode_dropdown.set_selected(0)
         self.zoom_spin.set_value(0)
         self.contrast_spin.set_value(0)
         self.brightness_spin.set_value(0)
@@ -447,3 +459,24 @@ class OptionsMenuButton(Gtk.MenuButton):
     @Gtk.Template.Callback()
     def _on_upscale_reset(self, _btn):
         self.upscale_dropdown.set_selected(0)
+
+    # --- AI RENDER (VIDEO2X) ---
+    @Gtk.Template.Callback()
+    def _on_video2x_mode_changed(self, dropdown, *arg):
+        idx = dropdown.get_selected()
+        mode = video2x.MODE_INDEX_MAP[idx] if idx < len(video2x.MODE_INDEX_MAP) else "off"
+        self._win.video2x.set_mode(mode)
+
+    @Gtk.Template.Callback()
+    def _on_video2x_render_changed(self, dropdown, *arg):
+        idx = dropdown.get_selected()
+        render = (
+            video2x.RENDER_INDEX_MAP[idx]
+            if idx < len(video2x.RENDER_INDEX_MAP)
+            else video2x.RENDER_PRE
+        )
+        self._win.video2x.set_render(render)
+
+    @Gtk.Template.Callback()
+    def _on_video2x_reset(self, _btn):
+        self.video2x_mode_dropdown.set_selected(0)

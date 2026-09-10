@@ -116,6 +116,61 @@ template $Preferences: Adw.Dialog {
 					};
 				}
 
+				Adw.ComboRow video2x_mode_row {
+					title: _("Default AI Render (video2x)");
+					subtitle: _("Upscale or interpolate videos with video2x_optimized when they open");
+
+					model: Gtk.StringList {
+						strings [
+							_("Off"),
+							_("Upscale ×4"),
+							_("Interpolate 2×"),
+							_("Interpolate 4×"),
+						]
+					};
+				}
+
+				Adw.ComboRow video2x_render_row {
+					title: _("AI Render Timing");
+					subtitle: _("Pre-render finishes the whole file first; Live plays while it renders and waits when it falls behind");
+
+					model: Gtk.StringList {
+						strings [
+							_("Pre-render"),
+							_("Live"),
+						]
+					};
+				}
+
+				Adw.ActionRow video2x_path_row {
+					title: _("video2x_optimized Folder");
+					subtitle: _("Not set");
+					activatable-widget: video2x_path_btn;
+
+					[suffix]
+					Button video2x_path_btn {
+						icon-name: "folder-open-symbolic";
+						tooltip-text: _("Choose Folder");
+						valign: center;
+
+						styles [
+							"flat",
+						]
+					}
+				}
+
+				Adw.ActionRow video2x_cache_row {
+					title: _("Rendered Video Cache");
+					subtitle: _("Empty");
+					activatable-widget: video2x_cache_btn;
+
+					[suffix]
+					Button video2x_cache_btn {
+						label: _("Clear");
+						valign: center;
+					}
+				}
+
 				Adw.ActionRow {
 					title: _("Restore Saved Session");
 					subtitle: _("Pick up where you left off after saving from the menu");

@@ -83,6 +83,76 @@ template $OptionsMenuButton: MenuButton {
           }
         }
 
+        // --- AI RENDER (VIDEO2X) ---
+        Box {
+          Box {
+            halign: start;
+
+            Button {
+              icon-name: "edit-undo-symbolic";
+              tooltip-text: _("Reset AI Render");
+
+              styles [
+                "flat",
+              ]
+
+              clicked => $_on_video2x_reset();
+            }
+
+            Label {
+              label: _("AI Render (video2x)");
+              wrap: true;
+              natural-wrap-mode: none;
+              halign: start;
+              margin-start: 8;
+
+              styles [
+                "heading",
+              ]
+            }
+          }
+
+          Separator {
+            hexpand: true;
+            opacity: 0;
+            margin-end: 2;
+          }
+
+          Gtk.DropDown video2x_render_dropdown {
+            halign: end;
+            width-request: 96;
+            margin-end: 6;
+            focus-on-click: false;
+            tooltip-text: _("Render the whole file before playing, or play while it renders");
+
+            model: Gtk.StringList video2x_render_list {
+              strings [
+                _("Pre-render"),
+                _("Live"),
+              ]
+            };
+
+            notify::selected => $_on_video2x_render_changed();
+          }
+
+          Gtk.DropDown video2x_mode_dropdown {
+            halign: end;
+            width-request: 108;
+            focus-on-click: false;
+
+            model: Gtk.StringList video2x_mode_list {
+              strings [
+                _("Off"),
+                _("Upscale ×4"),
+                _("Interpolate 2×"),
+                _("Interpolate 4×"),
+              ]
+            };
+
+            notify::selected => $_on_video2x_mode_changed();
+          }
+        }
+
         // --- ASPECT RATIO ---
         Box {
           Box {

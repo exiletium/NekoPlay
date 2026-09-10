@@ -18,6 +18,7 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 
 import logging
+import os
 from gettext import gettext as _
 
 import gi
@@ -27,8 +28,9 @@ gi.require_version("Gdk", "4.0")
 gi.require_version("GLib", "2.0")
 gi.require_version("Gio", "2.0")
 gi.require_version("Gtk", "4.0")
-from gi.repository import Adw, Gdk, Gio, Gtk
+from gi.repository import Adw, Gdk, Gio, GLib, Gtk
 
+from . import video2x
 from .anime4k import MODE_INDEX_MAP, MODE_TO_INDEX, apply_anime4k_shaders
 from .utils import CONFIG_DIR, display, has_host_permission, is_flatpak
 
@@ -106,6 +108,12 @@ class Preferences(Adw.Dialog):
     subtitle_lang_row: Adw.EntryRow = Gtk.Template.Child()
     audio_lang_row: Adw.EntryRow = Gtk.Template.Child()
     anime4k_mode_row: Adw.ComboRow = Gtk.Template.Child()
+    video2x_mode_row: Adw.ComboRow = Gtk.Template.Child()
+    video2x_render_row: Adw.ComboRow = Gtk.Template.Child()
+    video2x_path_row: Adw.ActionRow = Gtk.Template.Child()
+    video2x_path_btn: Gtk.Button = Gtk.Template.Child()
+    video2x_cache_row: Adw.ActionRow = Gtk.Template.Child()
+    video2x_cache_btn: Gtk.Button = Gtk.Template.Child()
 
     def __init__(self, window, **kwargs):
         super().__init__(**kwargs)
@@ -128,6 +136,8 @@ class Preferences(Adw.Dialog):
         self.anime4k_mode_row.connect(
             "notify::selected", self._on_anime4k_mode_ui_changed
         )
+
+        self._setup_video2x_rows()
         self.font_row.connect("activated", self._on_font_activated)
         self.reset_sub_font.connect("clicked", self._on_font_reset)
 
@@ -270,6 +280,77 @@ class Preferences(Adw.Dialog):
             self._mpv.command("af", "add", "@cine_loudnorm:lavfi=[loudnorm=I=-20]")
         else:
             self._mpv.command("af", "remove", "@cine_loudnorm")
+
+    # --- video2x ---
+    def _setup_video2x_rows(self):
+        v2x = self._win.video2x
+        self.video2x_mode_row.set_selected(video2x.MODE_TO_INDEX.get(v2x.mode, 0))
+        self.video2x_render_row.set_selected(video2x.RENDER_TO_INDEX.get(v2x.render, 0))
+        self.video2x_mode_row.connect("notify::selected", self._on_video2x_mode_ui_changed)
+        self.video2x_render_row.connect(
+            "notify::selected", self._on_video2x_render_ui_changed
+        )
+        self.video2x_path_btn.connect("clicked", self._on_video2x_path_clicked)
+        self.video2x_cache_btn.connect("clicked", self._on_video2x_cache_clear)
+        self._refresh_video2x_rows()
+
+    def _refresh_video2x_rows(self):
+        path = settings.get_string("video2x-path")
+        self.video2x_path_row.set_subtitle(path or _("Not set"))
+
+        size = video2x.cache_size()
+        if size:
+            self.video2x_cache_row.set_subtitle(
+                _("%s in %s") % (GLib.format_size(size), video2x.CACHE_DIR)
+            )
+        else:
+            self.video2x_cache_row.set_subtitle(_("Empty"))
+        self.video2x_cache_btn.set_sensitive(bool(size))
+
+    def _on_video2x_mode_ui_changed(self, row, *a):
+        idx = row.get_selected()
+        mode = (
+            video2x.MODE_INDEX_MAP[idx]
+            if idx < len(video2x.MODE_INDEX_MAP)
+            else video2x.MODE_OFF
+        )
+        self._win.video2x.set_mode(mode)
+
+    def _on_video2x_render_ui_changed(self, row, *a):
+        idx = row.get_selected()
+        render = (
+            video2x.RENDER_INDEX_MAP[idx]
+            if idx < len(video2x.RENDER_INDEX_MAP)
+            else video2x.RENDER_PRE
+        )
+        self._win.video2x.set_render(render)
+
+    def _on_video2x_path_clicked(self, _btn):
+        dialog = Gtk.FileDialog(title=_("video2x_optimized Folder"), modal=True)
+        current = settings.get_string("video2x-path")
+        if current and os.path.isdir(current):
+            dialog.set_initial_folder(Gio.File.new_for_path(current))
+
+        def done(dialog, result):
+            try:
+                folder = dialog.select_folder_finish(result)
+            except GLib.Error:
+                return  # dismissed
+            if folder is None:
+                return
+            path = folder.get_path() or ""
+            settings.set_string("video2x-path", path)
+            self._refresh_video2x_rows()
+            install = video2x.locate(path)
+            if not install.usable:
+                self._win.show_toast(install.problem)
+
+        dialog.select_folder(self._win, None, done)
+
+    def _on_video2x_cache_clear(self, _btn):
+        freed = video2x.clear_cache()
+        self._refresh_video2x_rows()
+        self._win.show_toast(_("Freed %s") % GLib.format_size(freed))
 
     def _on_anime4k_mode_ui_changed(self, row, *a):
         idx = row.get_selected()
