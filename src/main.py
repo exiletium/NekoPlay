@@ -19,8 +19,6 @@
 
 import logging
 import os
-import shutil
-import subprocess
 import sys
 from gettext import gettext as _
 from typing import cast
@@ -34,15 +32,22 @@ gi.require_version("GLib", "2.0")
 gi.require_version("Gtk", "4.0")
 from gi.repository import Adw, Gdk, Gio, GLib, Gtk
 
+from . import probe
 from .mpris import MPRIS
-from .platform_compat import IS_WINDOWS, SUBPROCESS_FLAGS
+from .platform_compat import IS_WINDOWS, trace
 from .preferences import Preferences, settings
 from .save_session import is_same_playlist
 from .window import CineWindow
 
 logger = logging.getLogger(__name__)
 
-if not IS_WINDOWS:
+if IS_WINDOWS:
+    # Naming the renderer saves GTK from trying the others first. It settles
+    # on the GL renderer here anyway, but only after an attempt that costs
+    # about 75 ms of a startup that is under a second to begin with.
+    # setdefault, so GSK_RENDERER=ngl still works as an escape hatch.
+    os.environ.setdefault("GSK_RENDERER", "gl")
+else:
     os.environ["GSK_RENDERER"] = "gl"
 
     # Set the icon shown in gnome sound settings
@@ -95,8 +100,10 @@ class CineApplication(Adw.Application):
 
     def do_startup(self):
         self.mpris = MPRIS(self)
+        trace("mpris built")
 
         Adw.Application.do_startup(self)
+        trace("Adw startup done")
 
         if IS_WINDOWS:
             provider = Gtk.CssProvider()
@@ -115,9 +122,12 @@ class CineApplication(Adw.Application):
             "preferences", self.on_preferences_action, ["<primary>comma"]
         )
 
+        trace("app started")
+
     def do_activate(self):
         win = CineWindow(application=self, is_activate=True)
         win.present()
+        trace("window presented")
 
     def do_open(self, files, n_files, hint):
         win: CineWindow = cast(CineWindow, self.props.active_window)
@@ -134,56 +144,18 @@ class CineApplication(Adw.Application):
                 if first_video_path:
                     break
 
-            # ffprobe only sizes the window before the first frame arrives;
-            # it ships with the Flatpak but is merely optional on Windows.
-            ffprobe = shutil.which("ffprobe")
+            trace("first file found")
 
-            if first_video_path and ffprobe:
-                try:
-                    cmd = [
-                        ffprobe,
-                        "-v",
-                        "error",
-                        "-select_streams",
-                        "v:0",
-                        "-show_entries",
-                        "stream=width,height:stream_side_data=rotation",
-                        "-of",
-                        "csv=s=x:p=0",
-                        first_video_path,
-                    ]
-                    output = subprocess.check_output(
-                        cmd,
-                        text=True,
-                        timeout=2,
-                        stderr=subprocess.DEVNULL,
-                        creationflags=SUBPROCESS_FLAGS,
-                    ).strip()
-
-                    if output:
-                        # "1920x1080x-90" or just "1920x1080"
-                        parts = output.splitlines()[0].split("x")
-
-                        width = int(parts[0])
-                        height = int(parts[1])
-
-                        try:
-                            rotation = int(parts[2]) if len(parts) > 2 else 0
-                        except Exception:
-                            logger.exception("Failed to get rotation")
-                            rotation = 0
-
-                        if abs(rotation) in (90, 270):
-                            w = height
-                            h = width
-                        else:
-                            w = width
-                            h = height
-
-                        win.set_window_size(w, h)
-                except Exception:
-                    logger.exception("Metadata probe failed")
+            if first_video_path:
+                # Sizes the window before the first frame arrives. Usually
+                # already answered: probe.prefetch started this while the
+                # process was still loading GTK.
+                size = probe.video_size(first_video_path)
+                if size:
+                    win.set_window_size(*size)
+                trace("size known")
             win.present()
+            trace("window presented")
         else:
             win.present()
             if is_same_playlist(win.mpv.playlist):
@@ -194,6 +166,8 @@ class CineApplication(Adw.Application):
             path = gfile.get_path() or gfile.get_uri()
             if path:
                 win.mpv.loadfile(path, "append-play")
+
+        trace("loadfile issued")
 
         for window in self.get_windows():
             w = cast(CineWindow, window)

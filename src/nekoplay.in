@@ -24,6 +24,18 @@ import sys
 import signal
 import locale
 import gettext
+import time
+
+# Startup milestones reached before src/ is on sys.path, flushed once
+# platform_compat (which owns the clock) can be imported. See trace().
+_early = []
+
+
+def _mark(label):
+    _early.append((label, time.perf_counter()))
+
+
+_mark('python running')
 
 VERSION = '@VERSION@'
 pkgdatadir = '@pkgdatadir@'
@@ -106,18 +118,37 @@ if os.name == 'nt':
         font, so without this it renders in whatever gets substituted - and
         the ellipsis in "Open..." comes out as a tofu box.
 
-        Both font backends have to be told, because which one Pango uses
-        depends on how GTK was built: fontconfig for the cairo/FT backend,
-        and GDI for pangowin32, which ignores fontconfig completely.
+        Which registry has to be told depends on which font matcher is in
+        use. Pango has two: fontconfig via the cairo/FT backend, and GDI via
+        pangowin32, which ignores fontconfig completely. This build selects
+        fontconfig above, and its libass has only the fontconfig provider
+        (mpv --sub-font-provider=help lists auto, none, fontconfig), so
+        nothing here looks fonts up through GDI and registering them there
+        is 40 ms of startup spent on nobody's behalf. Should the backend be
+        forced back to pangowin32, GDI becomes the one that matters, so the
+        registration follows the backend rather than assuming.
+
         AddFontResourceExW with FR_PRIVATE registers the file for this
         process only, so nothing is installed on the user's system.
         """
         import ctypes
-        from ctypes import wintypes
 
         font_dir = os.path.join(datadir, 'fonts')
         if not os.path.isdir(font_dir):
             return
+
+        if os.environ.get('PANGOCAIRO_BACKEND') in ('fc', 'fontconfig'):
+            try:
+                fc = ctypes.CDLL('libfontconfig-1.dll')
+                fc.FcConfigAppFontAddDir.restype = ctypes.c_int
+                fc.FcConfigAppFontAddDir.argtypes = [ctypes.c_void_p,
+                                                     ctypes.c_char_p]
+                fc.FcConfigAppFontAddDir(None, font_dir.encode('utf-8'))
+            except OSError as error:
+                print(f'Could not add the bundled fonts to fontconfig: {error!r}')
+            return
+
+        from ctypes import wintypes
 
         files = []
         for root, _dirs, names in os.walk(font_dir):
@@ -132,25 +163,33 @@ if os.name == 'nt':
         added = sum(1 for f in files
                     if gdi.AddFontResourceExW(f, FR_PRIVATE, None))
 
-        try:
-            fc = ctypes.CDLL('libfontconfig-1.dll')
-            fc.FcConfigAppFontAddDir.restype = ctypes.c_int
-            fc.FcConfigAppFontAddDir.argtypes = [ctypes.c_void_p,
-                                                 ctypes.c_char_p]
-            fc.FcConfigAppFontAddDir(None, font_dir.encode('utf-8'))
-        except OSError:
-            pass
-
         if added != len(files):
             print(f'Registered {added} of {len(files)} bundled fonts')
 
+sys.path.insert(1, pkgdatadir)
+signal.signal(signal.SIGINT, signal.SIG_DFL)
+
+from cine.platform_compat import TRACE, trace, _T0  # noqa: E402
+
+if TRACE:
+    for _label, _at in _early:
+        print('[trace] %7.1f ms  %s' % ((_at - _T0) * 1000, _label))
+
+# Loading GTK is about to take the better part of a second, and the window
+# cannot be sized until something has looked at the file. Start looking now
+# rather than at the end, when it is the only thing left to wait for.
+from cine import probe  # noqa: E402
+
+probe.prefetch(sys.argv[1:])
+trace('probe started')
+
+if os.name == 'nt':
     try:
         _add_bundled_fonts()
     except Exception as error:
         print(f'Could not register bundled fonts: {error!r}')
 
-sys.path.insert(1, pkgdatadir)
-signal.signal(signal.SIGINT, signal.SIG_DFL)
+    trace('fonts registered')
 
 
 def bind_locale():
@@ -218,6 +257,7 @@ try:
     bind_locale()
 except Exception as error:
     print(f'Cannot set locale: {error!r}')
+trace('locale bound')
 try:
     gettext.bindtextdomain('cine', localedir)
     gettext.textdomain('cine')
@@ -226,6 +266,8 @@ except:
 
 if __name__ == '__main__':
     import gi
+
+    trace('gi imported')
 
     from gettext import gettext as _
     from gi.repository import GLib
@@ -238,6 +280,9 @@ if __name__ == '__main__':
     from gi.repository import Gio
     resource = Gio.Resource.load(os.path.join(pkgdatadir, 'cine.gresource'))
     resource._register()
+    trace('gresource registered')
 
     from cine import main
+
+    trace('app modules imported')
     sys.exit(main.main(VERSION))

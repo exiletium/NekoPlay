@@ -47,6 +47,8 @@ from .platform_compat import (
     round_window_corners,
     inhibit_idle,
     is_document_portal_path,
+    TRACE,
+    trace,
     uninhibit_idle,
 )
 from .playlist import Playlist, PlaylistItemObj
@@ -257,6 +259,8 @@ class CineWindow(Adw.ApplicationWindow):
             watch_history_path=WATCH_HISTORY_JSONL,
         )
 
+        trace("mpv created")
+
         self._video_area = VideoGLArea(self.mpv)
         self.offload: Gtk.GraphicsOffload = Gtk.GraphicsOffload(child=self._video_area)
         self.offload.set_black_background(True)
@@ -305,6 +309,14 @@ class CineWindow(Adw.ApplicationWindow):
 
         # Needs the native window, which only exists once realized.
         self.connect("realize", lambda w: round_window_corners(w))
+
+        trace("window built")
+        if TRACE:
+            # Realizing the window is where the GDK surface, the D3D device
+            # and the GSK renderer are built, and that is the largest single
+            # step left in startup, so it gets its own marks.
+            self.connect("realize", lambda w: trace("window realized"))
+            self.connect("map", lambda w: trace("window mapped"))
 
     def _setup_actions(self):
         self._create_action("clear-and-add", self._on_clear_and_add)

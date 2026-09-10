@@ -237,6 +237,9 @@ if IS_WINDOWS:
         wedges in the corners - and DWM does not round a borderless
         client-side-decorated window of its own accord. Asking it directly
         gives the rounding back, drawn by the compositor rather than by GTK.
+
+        DWM also outlines rounded windows with a thin border of its own, which
+        the original does not have, so that is turned off at the same time.
         """
         try:
             surface = window.get_surface()
@@ -323,3 +326,54 @@ else:
 
     def uninhibit_idle(app, cookie) -> None:
         app.uninhibit(cookie)
+
+
+# --- Startup trace ---------------------------------------------------------
+#
+# Set NEKOPLAY_TRACE=1 to get a timestamped line per startup milestone. The
+# clock starts at process creation rather than at the first line of Python,
+# so the numbers include loading the interpreter and the ~200 DLLs behind
+# GTK - which is where most of a cold launch actually goes.
+
+TRACE = bool(os.environ.get("NEKOPLAY_TRACE"))
+
+
+def _process_start_time() -> float:
+    """When this process was created, on the time.perf_counter() scale."""
+    import time
+
+    now = time.perf_counter()
+    if IS_WINDOWS:
+        try:
+            k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+            k32.GetCurrentProcess.restype = ctypes.c_void_p
+            p_u64 = ctypes.POINTER(ctypes.c_ulonglong)
+            # Without argtypes the pseudo-handle is passed as a 32-bit int
+            # and the call just fails, which reads as a zero-length startup.
+            k32.GetProcessTimes.argtypes = [ctypes.c_void_p] + [p_u64] * 4
+            times = [ctypes.c_ulonglong() for _ in range(4)]
+            if k32.GetProcessTimes(
+                k32.GetCurrentProcess(), *[ctypes.byref(t) for t in times]
+            ):
+                # FILETIME is 100 ns ticks since 1601, and so is "now" from
+                # GetSystemTimePreciseAsFileTime, so the difference between
+                # them is the age of the process.
+                sys_now = ctypes.c_ulonglong()
+                k32.GetSystemTimePreciseAsFileTime(ctypes.byref(sys_now))
+                age = (sys_now.value - times[0].value) / 1e7
+                return now - age
+        except Exception:
+            pass
+    return now
+
+
+_T0 = _process_start_time() if TRACE else 0.0
+
+
+def trace(label: str) -> None:
+    """Note that a startup milestone has been reached."""
+    if not TRACE:
+        return
+    import time
+
+    print("[trace] %7.1f ms  %s" % ((time.perf_counter() - _T0) * 1000, label))

@@ -28,6 +28,8 @@ from .platform_compat import (
     get_display_param,
     gl_get_integerv,
     gl_get_proc_address,
+    TRACE,
+    trace,
 )
 
 gi.require_version("GLib", "2.0")
@@ -43,6 +45,8 @@ class BaseGLArea(Gtk.GLArea):
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
         self._ctx: mpv.MpvRenderContext | None = None
+        self._mpv: mpv.MPV | None = None
+        self._had_frame = False
         self._fbo = ctypes.c_int()
         self.connect("realize", self._on_realize)
         self.connect("render", self._on_render)
@@ -58,14 +62,32 @@ class BaseGLArea(Gtk.GLArea):
                 opengl_init_params={"get_proc_address": proc_address_fn},
                 **DISPLAY_PARAM,
             )
-            ctx.update_cb = lambda: GLib.idle_add(
-                self.queue_render,
-                priority=GLib.PRIORITY_HIGH_IDLE,  # type: ignore
-            )
+            ctx.update_cb = self._on_mpv_update
             return ctx
         except Exception:
             logger.exception("BaseGLArea _setup_mpv_context failed")
             return None
+
+    def _on_mpv_update(self):
+        """mpv has a frame for us, so ask for a redraw.
+
+        Under NEKOPLAY_TRACE this also reports the first real frame, which
+        is the end of startup as a user experiences it. The callback fires
+        once when the render context is created too, before any file is
+        loaded, so it has to check that the core is actually playing - the
+        synchronous read that needs is why this is behind the flag.
+        """
+        if TRACE and not self._had_frame:
+            try:
+                if self._mpv is not None and self._mpv.core_idle is False:
+                    self._had_frame = True
+                    trace("first frame from mpv")
+            except Exception:
+                pass
+        GLib.idle_add(
+            self.queue_render,
+            priority=GLib.PRIORITY_HIGH_IDLE,  # type: ignore
+        )
 
     def _on_realize(self, _area):
         raise NotImplementedError("Subclasses must implement _on_realize")
@@ -197,5 +219,8 @@ class VideoGLArea(BaseGLArea):
         self._mpv = mpv_instance
 
     def _on_realize(self, _area):
+        trace("GL area realize")
         self.make_current()
+        trace("GL context current")
         self._ctx = self._setup_mpv_context(self._mpv)
+        trace("mpv render context up")

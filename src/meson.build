@@ -92,6 +92,7 @@ cine_sources = [
   'platform_compat.py',
   'playlist.py',
   'preferences.py',
+  'probe.py',
   'save_session.py',
   'shortcuts.py',
   'utils.py',
