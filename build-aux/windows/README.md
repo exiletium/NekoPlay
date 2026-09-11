@@ -187,8 +187,11 @@ Measured on a 608×1080 30 fps clip on an RX 9060 XT: interpolate 2× runs at
 that clip pauses roughly once to catch up.
 
 Renders are cached under `%LOCALAPPDATA%\NekoPlay\video2x`, keyed by the
-source file, its size and mtime, and the mode; the cache size and a Clear
-button are in Preferences. Engines are per-resolution ONNX files: a missing
+source file, its size and mtime, and the mode. Preferences shows the size,
+a Clear button and a **Cache Limit** (default 10 GB): the moment the cache
+grows past it - at startup, before a render, and as each render completes -
+the renders not watched for longest are deleted until it fits. Half-written
+leftovers go first, and a render still being written or played is skipped. Engines are per-resolution ONNX files: a missing
 one is built on the spot if the install's Python has PyTorch (seconds for
 the upscaler, a minute or two for RIFE); otherwise the original plays and a
 toast says why. Videos with rotation metadata are played unrendered, because
