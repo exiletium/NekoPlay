@@ -81,5 +81,10 @@
 			<default>"pre"</default>
 			<summary>pre: render the whole file first; live: play while it renders</summary>
 		</key>
+		<key name="video2x-cache-limit" type="i">
+			<default>10</default>
+			<range min="1" max="2000"/>
+			<summary>Most the rendered-video cache may hold, in GB; the oldest renders go first</summary>
+		</key>
 	</schema>
 </schemalist>

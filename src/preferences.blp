@@ -171,6 +171,20 @@ template $Preferences: Adw.Dialog {
 					}
 				}
 
+				Adw.SpinRow video2x_cache_limit_row {
+					title: _("Cache Limit (GB)");
+					subtitle: _("The oldest renders are deleted as soon as the cache grows past this");
+					digits: 0;
+
+					adjustment: Gtk.Adjustment {
+						lower: 1;
+						upper: 2000;
+						step-increment: 1;
+						page-increment: 10;
+						value: 10;
+					};
+				}
+
 				Adw.ActionRow {
 					title: _("Restore Saved Session");
 					subtitle: _("Pick up where you left off after saving from the menu");

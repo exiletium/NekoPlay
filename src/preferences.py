@@ -114,6 +114,7 @@ class Preferences(Adw.Dialog):
     video2x_path_btn: Gtk.Button = Gtk.Template.Child()
     video2x_cache_row: Adw.ActionRow = Gtk.Template.Child()
     video2x_cache_btn: Gtk.Button = Gtk.Template.Child()
+    video2x_cache_limit_row: Adw.SpinRow = Gtk.Template.Child()
 
     def __init__(self, window, **kwargs):
         super().__init__(**kwargs)
@@ -292,6 +293,10 @@ class Preferences(Adw.Dialog):
         )
         self.video2x_path_btn.connect("clicked", self._on_video2x_path_clicked)
         self.video2x_cache_btn.connect("clicked", self._on_video2x_cache_clear)
+        self.video2x_cache_limit_row.set_value(settings.get_int("video2x-cache-limit"))
+        self.video2x_cache_limit_row.connect(
+            "notify::value", self._on_video2x_cache_limit_changed
+        )
         self._refresh_video2x_rows()
 
     def _refresh_video2x_rows(self):
@@ -301,7 +306,8 @@ class Preferences(Adw.Dialog):
         size = video2x.cache_size()
         if size:
             self.video2x_cache_row.set_subtitle(
-                _("%s in %s") % (GLib.format_size(size), video2x.CACHE_DIR)
+                _("%s of %d GB in %s")
+                % (GLib.format_size(size), settings.get_int("video2x-cache-limit"), video2x.CACHE_DIR)
             )
         else:
             self.video2x_cache_row.set_subtitle(_("Empty"))
@@ -346,6 +352,14 @@ class Preferences(Adw.Dialog):
                 self._win.show_toast(install.problem)
 
         dialog.select_folder(self._win, None, done)
+
+    def _on_video2x_cache_limit_changed(self, row, *a):
+        value = int(row.get_value())
+        if value != settings.get_int("video2x-cache-limit"):
+            # The controller trims on this change; the row catches up once
+            # that has had a moment to run.
+            settings.set_int("video2x-cache-limit", value)
+            GLib.timeout_add(700, lambda: self._refresh_video2x_rows() or False)
 
     def _on_video2x_cache_clear(self, _btn):
         freed = video2x.clear_cache()

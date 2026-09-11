@@ -537,6 +537,83 @@ def clear_cache() -> int:
     return freed
 
 
+def touch_cache_entry(key: str) -> None:
+    """Note that a render was just used, so it is the last to be evicted."""
+    try:
+        os.utime(cache_paths(key)[1], None)
+    except OSError:
+        pass
+
+
+def trim_cache(limit_bytes: int, keep: set[str] = frozenset()) -> int:
+    """Bring the cache under *limit_bytes*, oldest renders first.
+
+    A 4K render is about 7 GB an hour, so the cache would fill a drive on
+    its own. Age is the completion marker's mtime, which cache hits refresh,
+    so what goes is what has not been watched for longest. Renders still
+    being written (*keep*: the keys of running jobs) are left alone, as is
+    anything the OS will not let go of because the player has it open; that
+    one goes next time. Returns bytes freed.
+    """
+    try:
+        names = os.listdir(CACHE_DIR)
+    except OSError:
+        return 0
+
+    entries: dict[str, dict] = {}
+    for name in names:
+        key, ext = os.path.splitext(name)
+        if ext not in (".mkv", ".done"):
+            continue
+        try:
+            st = os.stat(os.path.join(CACHE_DIR, name))
+        except OSError:
+            continue
+        entry = entries.setdefault(key, {"size": 0, "age": 0.0, "complete": False})
+        entry["size"] += st.st_size
+        if ext == ".done":
+            entry["complete"] = True
+            entry["age"] = st.st_mtime
+
+    total = sum(e["size"] for e in entries.values())
+    freed = 0
+
+    def remove(key: str) -> int:
+        got = 0
+        for path in cache_paths(key):
+            try:
+                size = os.path.getsize(path)
+                os.remove(path)
+                got += size
+            except OSError:
+                pass
+        return got
+
+    # Leftovers from renders that never finished have no use at any size.
+    for key, entry in list(entries.items()):
+        if not entry["complete"] and key not in keep:
+            got = remove(key)
+            freed += got
+            total -= got
+            del entries[key]
+
+    victims = sorted(
+        (k for k, e in entries.items() if e["complete"] and k not in keep),
+        key=lambda k: entries[k]["age"],
+    )
+    for key in victims:
+        if total <= limit_bytes:
+            break
+        got = remove(key)
+        freed += got
+        total -= got
+    if freed:
+        logger.info(
+            "video2x: cache trimmed by %.1f MB to %.1f MB", freed / 2**20, total / 2**20
+        )
+    return freed
+
+
 # --- The render ------------------------------------------------------------
 
 
@@ -575,6 +652,7 @@ class RenderJob(threading.Thread):
         self.cond = threading.Condition()
         self._tree: ProcessTree | None = None
         self._cancelled = False
+        self.on_done = None  # called on this thread once the job is over
 
         multiplier = {MODE_INTERP2: 2, MODE_INTERP4: 4}.get(mode, 1)
         # What the output's frame rate will be, to turn a frame count into
@@ -630,6 +708,14 @@ class RenderJob(threading.Thread):
         except Exception as error:
             logger.exception("video2x render failed")
             self._set(phase="failed", error=str(error))
+        finally:
+            if not self.finished:
+                self._set(phase="failed", error=_("the render ended without a result"))
+            if self.on_done is not None:
+                try:
+                    self.on_done()
+                except Exception:
+                    logger.exception("video2x on_done failed")
 
     def _run(self) -> None:
         os.makedirs(CACHE_DIR, exist_ok=True)
@@ -793,6 +879,10 @@ class Video2X:
 
         settings.connect("changed::video2x-mode", lambda *a: self._publish_mode())
         settings.connect("changed::video2x-path", lambda *a: forget_install())
+        settings.connect("changed::video2x-cache-limit", lambda *a: self._trim_later())
+        # The limit may have been lowered, or a render left half-written,
+        # since the app last ran.
+        self._trim_later()
 
         @self._mpv.event_callback("client-message")
         def on_client_message(event):
@@ -835,6 +925,25 @@ class Video2X:
     def render(self) -> str:
         render = self._settings.get_string("video2x-render")
         return render if render in RENDER_INDEX_MAP else RENDER_PRE
+
+    @property
+    def cache_limit(self) -> int:
+        """In bytes; the setting is in whole GB."""
+        return max(1, self._settings.get_int("video2x-cache-limit")) * 1024**3
+
+    def _running_keys(self) -> set[str]:
+        with self._jobs_lock:
+            return {k for k, j in self._jobs.items() if not j.finished}
+
+    def trim_cache(self) -> None:
+        """Enforce the size limit; safe to call from any thread."""
+        try:
+            trim_cache(self.cache_limit, self._running_keys())
+        except Exception:
+            logger.exception("Trimming the video2x cache failed")
+
+    def _trim_later(self) -> None:
+        threading.Thread(target=self.trim_cache, name="video2x-trim", daemon=True).start()
 
     def set_mode(self, mode: str) -> None:
         if mode not in MODE_INDEX_MAP or mode == self.mode:
@@ -936,9 +1045,14 @@ class Video2X:
         output, marker = cache_paths(key)
         if os.path.isfile(marker) and os.path.isfile(output):
             logger.info("video2x: cache hit for %s (%s)", os.path.basename(path), mode)
+            touch_cache_entry(key)
             return output
 
+        # Make room before, and hold the line after: the new render counts
+        # against the limit as soon as it is complete.
+        self.trim_cache()
         job = self._start_or_join(install, source, mode, key)
+        job.on_done = self.trim_cache
         idle_add_once(self._show_progress, job)
 
         with self._jobs_lock:
