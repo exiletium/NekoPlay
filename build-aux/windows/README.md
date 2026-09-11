@@ -231,23 +231,55 @@ Two timings, in Preferences under **AI Render Timing**:
   with a progress toast that can cancel; cancelling plays the original.
   Full quality and full seeking.
 - **Live** opens the output once ~4 s of it exist past where playback will
-  start - a resume, or the file re-opened after a setting changed, does not
-  begin at zero - and plays it as it grows. In a chain that wait includes
-  every pass before the last, since only the last writes the file played.
-  When the render is slower than playback the player pauses with
-  "Rendering ahead…" on the OSD and continues once the render is 4 s ahead
-  again, like buffering a stream. Seeking beyond what has been rendered
-  waits in the same way. Two things make this work: mpv follows a growing
-  file as long as it never reads to the end (`--stream` makes the muxer
-  flush every second), and if it does hit EOF, a seek to the same position
-  makes the demuxer look again. mpv's own duration for a growing file is
-  only what has been written, so while a live render runs the window shows
-  the source's length instead (`set_duration_override`), and mpv's value
-  again once the render completes.
+  start and plays it as it grows. In a chain that wait includes every pass
+  before the last, since only the last writes the file played. When the
+  render is slower than playback the player pauses with "Rendering ahead…"
+  on the OSD and continues once the render is 4 s ahead again, like
+  buffering a stream. mpv follows a growing file as long as it never reads
+  to the end (`--stream` makes the muxer flush every second), and if it
+  does hit EOF, a seek to the same position makes the demuxer look again.
 
-Measured on a 608×1080 30 fps clip on an RX 9060 XT: interpolate 2× runs at
-4.0× realtime, upscale ×4 (to 2432×4320) at 0.88× - so live upscaling of
-that clip pauses roughly once to catch up.
+What mpv opens in live mode is not the growing file but an EDL naming it,
+with the film's full length declared - mpv's own idea of a growing file's
+length is however much has been written, so the seek bar would otherwise
+end at the render's frontier. The EDL also settles seeking. A seek past
+the frontier is simply held by mpv until those frames exist (the demuxer
+reports the seek target as the position meanwhile, which is how the app
+knows where the user wants to be); if the render would take more than
+8 s to get there, the app cancels it and starts another from 2 s before
+the target (video2x's `--start`), and the EDL then reads: the original
+from 0 to that point, then the new render. Seeking back lands in the
+original, seeking forward in the render, and the bar spans the whole film
+throughout. The same rule applies when a file opens far in - a resume -
+rather than rendering everything before the resume point first. A render
+started part-way is for that sitting only: it is never marked complete
+and is swept when playback of it ends.
+
+Live renders are also fitted to the machine. Every render times its
+steady part, and the seconds per output frame per input megapixel it
+measures - the GPU cost is linear in input pixels - is kept per kind of
+pass in `%LOCALAPPDATA%\NekoPlay\video2x-speed.json`. From then on a live
+upscale has video2x decode the source small enough for the pass to run at
+1.25× realtime (`--max-output-height`), rounded down to a multiple of 24
+lines and never below half of what the screen can show of the source,
+nor below what the screen needs; the toast says what will come out
+("Upscale ×4 at 3552p"). The first live upscale on a machine has no
+record yet and runs at full size, pausing if it must. Pre-renders always
+run at full size, and a complete full-size render serves live sessions
+too; a live render decoded smaller only serves later live sessions that
+would have settled for that size or a little less (down to 85% of the
+plan, so the record's drift between renders does not mean a new render
+each time). Interpolation is never decoded smaller: video2x's
+interpolation stalls under `--max-output-height` at present, so in a
+chain RIFE runs at the source's size and the upscaler scales its output
+down as it reads it.
+
+Measured on a 608×1080 30 fps clip on an RX 9060 XT (1080p screen):
+interpolate 2× runs at 4.0× realtime; upscale ×4 at full size (to
+2432×4320) at 0.79×, so the first live session pauses once; fitted, it
+decodes at 500×888 and runs at 1.2× with no pauses. A seek 20 s ahead
+during a live upscale restarts from there and is playing again 6 s later
+(11 s uncapped, most of it the 4 s lead at 0.79×).
 
 Renders are cached under `%LOCALAPPDATA%\NekoPlay\video2x`, keyed by the
 source file, its size and mtime, and the mode. Preferences shows the size,
@@ -260,11 +292,14 @@ the upscaler, a minute or two for RIFE); otherwise the original plays and a
 toast says why. Recent video2x_optimized builds a missing engine itself, in
 under a second and without PyTorch, by re-targeting one it has
 (`video2x_opt.onnx_respec`); `Install.can_autobuild` detects that and skips
-the pre-build. Videos with rotation metadata are played unrendered, because
-the pipeline's decoder would autorotate them into the wrong shape. A render
-left running when the window closes is killed with everything it spawned -
-a Windows Job Object flagged kill-on-close, so this holds even if the app
-dies.
+the pre-build, and `has_engine` looks in `models\auto`, where video2x keeps
+what it built (capped at 1 GB, oldest out first), as well as `models\`.
+Videos with rotation metadata render fine: ffmpeg applies the display
+matrix on decode, so video2x sees the frame upright and its output is
+plain upright video; the app describes such a source by its displayed
+size, which is the frame the engine has to fit. A render left running
+when the window closes is killed with everything it spawned - a Windows
+Job Object flagged kill-on-close, so this holds even if the app dies.
 
 ## Looping
 

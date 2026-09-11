@@ -196,9 +196,6 @@ class CineWindow(Adw.ApplicationWindow):
         self._hide_timeout_id: int = 0
         self._is_fullscreen: bool = False
         self._is_inactive: bool = False
-        # A length to show instead of mpv's, while a live AI render is still
-        # growing the file mpv is reading (mpv's own duration grows with it).
-        self._duration_override: float | None = None
         self._loop_seams: list[float] = []  # see _loop_probe
         self._mpv_ctx: mpv.MpvRenderContext
 
@@ -1155,7 +1152,7 @@ class CineWindow(Adw.ApplicationWindow):
 
         try:
             if self._show_remaining:
-                duration = self._duration_override or float(self.mpv.duration or 0)
+                duration = float(self.mpv.duration or 0)
                 remaining = (duration - curr_time) if duration > curr_time else 0
                 self.time_elapsed_label.props.label = f"-{format_time(remaining)}"
             else:
@@ -1283,26 +1280,7 @@ class CineWindow(Adw.ApplicationWindow):
             self._loop_prev_wrap = now
         self._loop_prev_pos = pos
 
-    def set_duration_override(self, duration: float | None) -> None:
-        """Show *duration* as the file's length until told otherwise.
-
-        video2x's live mode plays a file that is still being written, and
-        mpv reports only as much duration as has been written so far - a
-        seek bar whose end keeps moving. The real length is known from the
-        source, so the follower supplies it here and withdraws it (None)
-        when the render completes, at which point mpv's own value is right.
-        """
-        self._duration_override = duration
-        if duration is None:
-            try:
-                duration = float(self.mpv.duration or 0)
-            except mpv.ShutdownError:
-                return
-        self._update_duration(duration)
-
     def _update_duration(self, duration):
-        if self._duration_override is not None:
-            duration = self._duration_override
         self.time_total_label.set_text(format_time(duration))
 
         if duration == 0:

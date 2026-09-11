@@ -36,8 +36,13 @@ Two ways to wait for the render:
   start until the render has finished.
 - **Live** opens the output as soon as a few seconds of it exist and follows
   the file as it grows. When the render is slower than playback the player
-  waits for it, the way it would buffer a stream. Seeking ahead of what has
-  been rendered waits too, because the render is sequential.
+  waits for it, the way it would buffer a stream - and once a pass has been
+  timed on this machine, the source is decoded small enough that the next
+  live render is not slower (LIVE_HEADROOM). Seeking far past what has been
+  rendered starts a new render from there rather than waiting for the old
+  one to arrive. What mpv opens in live mode is an EDL: the original up to
+  where the render begins, then the growing file, with the film's full
+  length declared, so the seek bar spans the whole film from the start.
 
 Two settings, upscaling and frame interpolation, combine into a recipe of
 one or two passes (interpolation first; see Recipe). Rendered files are
@@ -55,6 +60,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import math
 import os
 import re
 import shutil
@@ -68,8 +74,9 @@ from gettext import gettext as _
 import gi
 
 gi.require_version("Adw", "1")
+gi.require_version("Gdk", "4.0")
 gi.require_version("GLib", "2.0")
-from gi.repository import Adw, GLib
+from gi.repository import Adw, Gdk, GLib
 
 from .platform_compat import IS_WINDOWS, SUBPROCESS_FLAGS, TRACE, ProcessTree
 from .utils import CONFIG_DIR, idle_add_once
@@ -176,6 +183,26 @@ LIVE_LEAD_SECONDS = 4.0
 # few frames back; staying this far from the end of the file keeps the
 # demuxer from ever seeing EOF while the render is still going.
 LIVE_MARGIN_SECONDS = 1.5
+# A live render is meant to keep up with playback. Once a kind of pass has
+# been timed on this machine (see record_speed), the source is decoded small
+# enough for the pass to run this much faster than realtime.
+LIVE_HEADROOM = 1.25
+# Seeking past what has been rendered: if the render would take longer than
+# this to get there, start another one from there instead of waiting.
+LIVE_RESTART_WAIT_SECONDS = 8.0
+# A render started for a seek begins this far before the target, so that a
+# small step back does not fall out of the rendered part.
+LIVE_BACKOFF_SECONDS = 2.0
+# Decoding smaller stops here: the models make little sense below it.
+LIVE_MIN_DECODE_HEIGHT = 240
+# Decode heights are rounded down to this step, so that the small drift in
+# the speed record from one render to the next does not make every live
+# session a slightly different size - and a different cache entry.
+DECODE_STEP = 24
+
+# Where the timings live: seconds per output frame per input megapixel, by
+# kind of pass. Outside the cache directory so clearing the cache keeps them.
+SPEED_FILE = os.path.join(CONFIG_DIR, "video2x-speed.json")
 
 CACHE_DIR = os.path.join(CONFIG_DIR, "video2x")
 
@@ -208,6 +235,11 @@ class Install:
     @property
     def models_dir(self) -> str:
         return os.path.join(self.root, "models")
+
+    @property
+    def engine_dirs(self) -> list[str]:
+        """Where engines are: the shipped set, then the ones video2x built."""
+        return [self.models_dir, os.path.join(self.models_dir, "auto")]
 
     @property
     def can_export(self) -> bool:
@@ -249,14 +281,14 @@ class Install:
         return os.path.join(self.models_dir, f"rife_v4.26_{width}x{height}_u8_fast.onnx")
 
     def has_engine(self, stage: Stage, width: int, height: int) -> bool:
-        if os.path.isfile(self.engine_path(stage, width, height)):
-            return True
+        names = [os.path.basename(self.engine_path(stage, width, height))]
         if stage.kind != STAGE_UPSCALE:
             # The CLI falls back to the reference engine when there is no
             # fast one for a resolution.
-            reference = os.path.join(self.models_dir, f"rife_v4.26_{width}x{height}_u8.onnx")
-            return os.path.isfile(reference)
-        return False
+            names.append(f"rife_v4.26_{width}x{height}_u8.onnx")
+        return any(
+            os.path.isfile(os.path.join(d, name)) for d in self.engine_dirs for name in names
+        )
 
     def export_command(self, stage: Stage, width: int, height: int) -> list[str]:
         assert self.python
@@ -293,13 +325,33 @@ class Install:
             os.path.relpath(self.engine_path(stage, width, height), self.root),
         ]
 
-    def render_command(self, stage: Stage, src: str, dst: str, stream: bool) -> list[str]:
+    def render_command(
+        self,
+        stage: Stage,
+        src: str,
+        dst: str,
+        stream: bool,
+        offset: float = 0.0,
+        max_height: int = 0,
+    ) -> list[str]:
+        """The command for one pass.
+
+        *offset* is where in the source to begin, in seconds; the output's
+        timestamps start at zero regardless. *max_height* has video2x decode
+        the source smaller, so that this pass's output is at most that tall:
+        for an upscale that is four times the decode height, for
+        interpolation the decode height itself.
+        """
         assert self.python
         cmd = [self.python, "-m", "video2x_opt", "-i", src, "-o", dst]
         if stage.kind == STAGE_UPSCALE:
             cmd.append("--upscale")
         else:
             cmd += ["-m", str(stage.factor)]
+        if offset > 0:
+            cmd += ["--start", "%.3f" % offset]
+        if max_height > 0:
+            cmd += ["--max-output-height", str(max_height)]
         if stream:
             cmd.append("--stream")
         return cmd
@@ -501,6 +553,10 @@ def _locate(configured: str) -> Install:
 
 @dataclass
 class Source:
+    """A file to render. Width and height are as displayed: a phone video
+    stored on its side with a 90° display matrix is tall here, because that
+    is the frame video2x decodes and the engine has to fit."""
+
     path: str
     width: int
     height: int
@@ -508,6 +564,24 @@ class Source:
     nb_frames: int
     duration: float
     rotation: int
+
+
+def decode_size(source: Source, max_height: int, upscale: int) -> tuple[int, int] | None:
+    """The size video2x decodes *source* at for ``--max-output-height``.
+
+    The same arithmetic as video2x_opt's scaled_source_size, so that the
+    engine looked for here is the one the render will ask for. None when
+    the source already fits.
+    """
+    if max_height <= 0:
+        return None
+    target_h = max_height // max(1, upscale)
+    if target_h <= 0 or source.height <= target_h:
+        return None
+    f = target_h / float(source.height)
+    w = max(2, int(round(source.width * f)) & ~1)
+    h = max(2, int(target_h) & ~1)
+    return w, h
 
 
 def parse_start(value: str) -> float:
@@ -587,10 +661,16 @@ def probe_source(path: str, ffmpeg_dir: str | None) -> Source | None:
     except (TypeError, ValueError):
         pass
 
+    width, height = int(video.get("width", 0)), int(video.get("height", 0))
+    if rotation % 180 == 90:
+        # ffmpeg applies the display matrix on decode, so video2x sees the
+        # frame upright: the coded 1080x608 arrives as 608x1080.
+        width, height = height, width
+
     return Source(
         path=path,
-        width=int(video.get("width", 0)),
-        height=int(video.get("height", 0)),
+        width=width,
+        height=height,
         fps=fps,
         nb_frames=nb_frames,
         duration=duration,
@@ -601,10 +681,24 @@ def probe_source(path: str, ffmpeg_dir: str | None) -> Source | None:
 # --- The cache -------------------------------------------------------------
 
 
-def cache_key(source: Source, recipe: Recipe) -> str:
+def cache_key(source: Source, recipe: Recipe, decode_height: int = 0) -> str:
+    """One key per file, recipe and - when the source was decoded smaller
+    to keep a live render realtime - decode height, because that is a
+    different, lesser output."""
     stat = os.stat(source.path)
     raw = f"{os.path.abspath(source.path)}|{stat.st_size}|{int(stat.st_mtime)}|{recipe.key}"
+    if decode_height:
+        raw += f"|h{decode_height}"
     return hashlib.sha1(raw.encode("utf-8", "surrogateescape")).hexdigest()[:20]
+
+
+def partial_stem(key: str, offset: float) -> str:
+    """The name stem of a render that begins *offset* seconds in.
+
+    Such a render is for one sitting - it is never complete - so it gets
+    no marker and is swept as soon as playback lets go of it.
+    """
+    return f"{key}.from{int(round(offset * 1000))}"
 
 
 def stage_path(key: str, index: int) -> str:
@@ -682,26 +776,27 @@ def trim_cache(limit_bytes: int, keep: set[str] = frozenset()) -> int:
         key, ext = os.path.splitext(name)
         if ext not in (".mkv", ".done"):
             continue
-        # <key>.stage1.mkv belongs to <key>.
-        key = key.split(".", 1)[0]
+        # <key>.stage1.mkv and <key>.from12000.mkv belong to <key>.
+        key, _, rest = key.partition(".")
         try:
             st = os.stat(os.path.join(CACHE_DIR, name))
         except OSError:
             continue
-        entry = entries.setdefault(key, {"size": 0, "age": 0.0, "complete": False})
+        entry = entries.setdefault(
+            key, {"size": 0, "age": 0.0, "complete": False, "partials": []}
+        )
         entry["size"] += st.st_size
         if ext == ".done":
             entry["complete"] = True
             entry["age"] = st.st_mtime
+        elif rest.startswith("from"):
+            entry["partials"].append(name)
 
     total = sum(e["size"] for e in entries.values())
     freed = 0
 
-    def remove(key: str) -> int:
+    def remove_files(paths) -> int:
         got = 0
-        paths = list(cache_paths(key)) + [
-            os.path.join(CACHE_DIR, n) for n in names if n.startswith(key + ".stage")
-        ]
         for path in paths:
             try:
                 size = os.path.getsize(path)
@@ -711,13 +806,26 @@ def trim_cache(limit_bytes: int, keep: set[str] = frozenset()) -> int:
                 pass
         return got
 
-    # Leftovers from renders that never finished have no use at any size.
+    def remove(key: str) -> int:
+        return remove_files(
+            os.path.join(CACHE_DIR, n) for n in names if n.partition(".")[0] == key
+        )
+
+    # Leftovers from renders that never finished have no use at any size,
+    # and a render made for one seek has none once that sitting is over.
     for key, entry in list(entries.items()):
-        if not entry["complete"] and key not in keep:
+        if key in keep:
+            continue
+        if not entry["complete"]:
             got = remove(key)
             freed += got
             total -= got
             del entries[key]
+        elif entry["partials"]:
+            got = remove_files(os.path.join(CACHE_DIR, n) for n in entry["partials"])
+            freed += got
+            total -= got
+            entry["size"] -= got
 
     victims = sorted(
         (k for k, e in entries.items() if e["complete"] and k not in keep),
@@ -734,6 +842,64 @@ def trim_cache(limit_bytes: int, keep: set[str] = frozenset()) -> int:
             "video2x: cache trimmed by %.1f MB to %.1f MB", freed / 2**20, total / 2**20
         )
     return freed
+
+
+# --- How fast this machine renders ---------------------------------------
+#
+# The GPU cost of a pass is linear in the input's megapixels, so one number
+# per kind of pass - seconds per output frame per input megapixel - says
+# what any resolution will do. It is measured from the steady part of every
+# render and kept across runs, and a live render uses it to pick a decode
+# size that keeps up with playback. The first live render on a machine has
+# nothing to go on and runs at full size, pausing if it must.
+
+_speed_lock = threading.Lock()
+_speed: dict[str, float] | None = None
+
+
+def _load_speed() -> dict[str, float]:
+    global _speed
+    if _speed is None:
+        try:
+            with open(SPEED_FILE, encoding="utf-8") as f:
+                data = json.load(f)
+            _speed = {k: float(v) for k, v in data.items() if float(v) > 0}
+        except (OSError, ValueError, AttributeError):
+            _speed = {}
+    return _speed
+
+
+def seconds_per_frame_megapixel(kind: str) -> float | None:
+    with _speed_lock:
+        return _load_speed().get(kind)
+
+
+def record_speed(kind: str, seconds_per_frame_mp: float) -> None:
+    """Fold one render's measurement into the record for *kind*."""
+    if not seconds_per_frame_mp > 0:
+        return
+    with _speed_lock:
+        speed = _load_speed()
+        old = speed.get(kind)
+        speed[kind] = seconds_per_frame_mp if old is None else (old + seconds_per_frame_mp) / 2
+        try:
+            os.makedirs(CONFIG_DIR, exist_ok=True)
+            with open(SPEED_FILE, "w", encoding="utf-8") as f:
+                json.dump(speed, f)
+        except OSError:
+            logger.exception("Could not save the video2x speed record")
+    logger.info(
+        "video2x: %s runs at %.4f s per frame per megapixel on this machine", kind, speed[kind]
+    )
+
+
+def estimated_out_fps(kind: str, width: int, height: int) -> float | None:
+    """What a pass of *kind* should manage on input of this size, or None
+    before that kind has ever been timed here."""
+    k = seconds_per_frame_megapixel(kind)
+    if k is None:
+        return None
+    return 1.0 / (k * width * height / 1e6)
 
 
 # --- The render ------------------------------------------------------------
@@ -769,24 +935,73 @@ class RenderJob(threading.Thread):
     ``cond`` is notified on every change, so a waiter can sleep on it.
     """
 
-    def __init__(self, install: Install, source: Source, recipe: Recipe, stream: bool):
+    def __init__(
+        self,
+        install: Install,
+        source: Source,
+        recipe: Recipe,
+        stream: bool,
+        offset: float = 0.0,
+        decode: tuple[int, int] | None = None,
+    ):
+        """*offset*: begin this many seconds into the source; such a render
+        is for one sitting and is never cached. *decode*: the size to decode
+        the source at, when a live render has to be smaller to keep up."""
         super().__init__(name="video2x-render", daemon=True)
         self.install = install
         self.source = source
         self.recipe = recipe
         self.stages = recipe.stages
         self.stream = stream
-        self.key = cache_key(source, recipe)
-        self.output, self.marker = cache_paths(self.key)
+        self.offset = max(0.0, offset)
+        self.decode = decode
+        self.key = cache_key(source, recipe, decode[1] if decode else 0)
+        if self.offset:
+            self.stem = partial_stem(self.key, self.offset)
+            self.output = os.path.join(CACHE_DIR, self.stem + ".mkv")
+            self.marker = None
+        else:
+            self.stem = self.key
+            self.output, self.marker = cache_paths(self.key)
         self.progress = Progress(stages=len(self.stages))
         self.cond = threading.Condition()
         self._tree: ProcessTree | None = None
         self._cancelled = False
+        self._rate_anchor: tuple[float, int] | None = None
+        self._rate_last: tuple[float, int] | None = None
         self.on_done = None  # called on this thread once the job is over
 
         # The final output's frame rate, to turn a frame count into seconds
         # for the live follower.
         self.out_fps = source.fps * recipe.interp
+
+    def frame_size(self, stage: Stage) -> tuple[int, int]:
+        """The size of the frames *stage* works on.
+
+        Only the upscaler decodes smaller: video2x's interpolation stalls
+        with --max-output-height as of this writing, so in a chain the
+        interpolation runs at the source's size and the upscaler scales
+        its output down as it reads it.
+        """
+        if self.decode and stage.kind == STAGE_UPSCALE:
+            return self.decode
+        return self.source.width, self.source.height
+
+    def stage_input_fps(self, index: int) -> float:
+        """The frame rate going into pass *index*: the source's, or the
+        interpolated one if a pass before it multiplied that."""
+        return self.source.fps * (self.recipe.interp if index > 0 else 1)
+
+    def speed(self) -> float:
+        """How fast the running pass is going relative to realtime, from the
+        progress so far; 0 before anything is known."""
+        with self.cond:
+            p = self.progress
+            if p.phase != "render" or not p.out_fps:
+                return 0.0
+            stage = self.stages[min(p.stage, len(self.stages) - 1)]
+            want = stage.out_fps(self.stage_input_fps(p.stage))
+            return p.out_fps / want if want else 0.0
 
     # -- state --------------------------------------------------------------
 
@@ -799,7 +1014,7 @@ class RenderJob(threading.Thread):
         return self.progress.phase == "done"
 
     def rendered_seconds(self) -> float:
-        """How far into the file the final output has got.
+        """How much of the final output exists, in seconds from its start.
 
         Zero while an earlier pass of a chain is still running: nothing of
         the file that will be played exists yet.
@@ -810,6 +1025,10 @@ class RenderJob(threading.Thread):
             if self.progress.stage != len(self.stages) - 1:
                 return 0.0
             return self.progress.frames_done / self.out_fps
+
+    def frontier(self) -> float:
+        """Where in the source the final output reaches, in source time."""
+        return self.offset + self.rendered_seconds()
 
     @property
     def streaming(self) -> bool:
@@ -862,27 +1081,27 @@ class RenderJob(threading.Thread):
         os.makedirs(CACHE_DIR, exist_ok=True)
         src = self.source
 
-        # Every pass keeps the source's width and height (interpolation
-        # changes only the frame rate, and upscaling is last), so one engine
-        # check per kind of pass covers the chain.
         for stage in self.stages:
-            if not self._ensure_engine(stage, src.width, src.height):
+            if not self._ensure_engine(stage, *self.frame_size(stage)):
                 return
 
         # Anything left over from a run that did not finish.
         for path in (self.output, self.marker):
-            try:
-                os.remove(path)
-            except OSError:
-                pass
+            if path:
+                try:
+                    os.remove(path)
+                except OSError:
+                    pass
 
         last = len(self.stages) - 1
         inputs = src.path
         frames = src.nb_frames
+        if self.offset and src.duration:
+            frames = max(1, int(round((src.duration - self.offset) * src.fps)))
         intermediates = []
         for index, stage in enumerate(self.stages):
             is_last = index == last
-            output = self.output if is_last else stage_path(self.key, index)
+            output = self.output if is_last else stage_path(self.stem, index)
             if not is_last:
                 intermediates.append(output)
             self._set(
@@ -892,10 +1111,23 @@ class RenderJob(threading.Thread):
                 frames_total=stage.out_frames(frames),
                 out_fps=0.0,
             )
+            self._rate_anchor = self._rate_last = None
+            width, height = self.frame_size(stage)
+            max_height = 0
+            if self.decode and stage.kind == STAGE_UPSCALE:
+                max_height = height * stage.factor
             ok = self._run_child(
-                self.install.render_command(stage, inputs, output, self.stream and is_last),
+                self.install.render_command(
+                    stage,
+                    inputs,
+                    output,
+                    self.stream and is_last,
+                    offset=self.offset if index == 0 else 0.0,
+                    max_height=max_height,
+                ),
                 self._on_progress_line,
             )
+            self._record_speed(stage, width, height)
             if not ok or not os.path.isfile(output) or os.path.getsize(output) == 0:
                 # Half a file is no use to anyone. The final output may
                 # still be open in the player after a live session, in
@@ -917,9 +1149,24 @@ class RenderJob(threading.Thread):
             except OSError:
                 pass
 
-        with open(self.marker, "w", encoding="utf-8") as marker:
-            json.dump({"source": src.path, "recipe": self.recipe.key}, marker)
+        if self.marker:
+            with open(self.marker, "w", encoding="utf-8") as marker:
+                json.dump(
+                    {"source": src.path, "recipe": self.recipe.key, "decode": self.decode},
+                    marker,
+                )
         self._set(phase="done")
+
+    def _record_speed(self, stage: Stage, width: int, height: int) -> None:
+        """Time the steady part of the pass that just ran, if there was
+        enough of it to mean anything."""
+        if not self._rate_anchor or not self._rate_last:
+            return
+        (t0, f0), (t1, f1) = self._rate_anchor, self._rate_last
+        if t1 - t0 < 2.0 or f1 - f0 < 30:
+            return
+        fps = (f1 - f0) / (t1 - t0)
+        record_speed(stage.kind, (1.0 / fps) / (width * height / 1e6))
 
     def _ensure_engine(self, stage: Stage, width: int, height: int) -> bool:
         if self.install.has_engine(stage, width, height):
@@ -1005,12 +1252,21 @@ class RenderJob(threading.Thread):
         m = _PROGRESS.search(line)
         if not m:
             return
+        done, total = int(m.group(2)), int(m.group(3)) or self.progress.frames_total
         self._set(
-            frames_done=int(m.group(2)),
-            frames_total=int(m.group(3)) or self.progress.frames_total,
+            frames_done=done,
+            frames_total=total,
             out_fps=float(m.group(4)),
             infer_ms=float(m.group(5)),
         )
+        # For the speed record: the pass is timed from its first sixth on,
+        # past DirectML's shader compilation and the pipeline filling up.
+        now = time.monotonic()
+        if self._rate_anchor is None:
+            if total and done >= max(20, total // 6):
+                self._rate_anchor = (now, done)
+        else:
+            self._rate_last = (now, done)
 
 
 # --- The controller --------------------------------------------------------
@@ -1044,6 +1300,19 @@ class Video2X:
         self._live_paused_by_us = False
         self._live_poll_id = 0
         self._live_last_osd = 0.0
+        self._live_restarted_at = 0.0
+
+        # The tallest screen, in pixels: a live render decoded smaller to
+        # keep up is never made smaller than what the screen can show.
+        self._screen_height = 0
+        try:
+            display = Gdk.Display.get_default()
+            monitors = display.get_monitors() if display else None
+            if monitors is not None:
+                monitors.connect("items-changed", lambda *a: self._measure_screens())
+            self._measure_screens()
+        except Exception:
+            logger.exception("Could not measure the screens")
 
         self._load_script()
         self._publish_mode()
@@ -1113,14 +1382,33 @@ class Video2X:
         """In bytes; the setting is in whole GB."""
         return max(1, self._settings.get_int("video2x-cache-limit")) * 1024**3
 
-    def _running_keys(self) -> set[str]:
+    def _measure_screens(self) -> None:
+        display = Gdk.Display.get_default()
+        if display is None:
+            return
+        tallest = 0
+        monitors = display.get_monitors()
+        for i in range(monitors.get_n_items()):
+            monitor = monitors.get_item(i)
+            geometry = monitor.get_geometry()
+            scale = monitor.get_scale() if hasattr(monitor, "get_scale") else monitor.get_scale_factor()
+            tallest = max(tallest, int(round(geometry.height * scale)))
+        self._screen_height = tallest
+
+    def _keys_in_use(self) -> set[str]:
+        """Cache keys the trimmer must not touch: renders still being
+        written, and the one being played."""
         with self._jobs_lock:
-            return {k for k, j in self._jobs.items() if not j.finished}
+            keys = {j.key for j in self._jobs.values() if not j.finished}
+        live = self._live
+        if live is not None:
+            keys.add(live.key)
+        return keys
 
     def trim_cache(self) -> None:
         """Enforce the size limit; safe to call from any thread."""
         try:
-            trim_cache(self.cache_limit, self._running_keys())
+            trim_cache(self.cache_limit, self._keys_in_use())
         except Exception:
             logger.exception("Trimming the video2x cache failed")
 
@@ -1131,13 +1419,13 @@ class Video2X:
         if value not in UPSCALE_INDEX_MAP or value == self.upscale:
             return
         self._settings.set_string("video2x-upscale", value)
-        self._reopen_current()
+        self._reload_current()
 
     def set_interp(self, value: str) -> None:
         if value not in INTERP_INDEX_MAP or value == self.interp:
             return
         self._settings.set_string("video2x-interp", value)
-        self._reopen_current()
+        self._reload_current()
 
     def set_render(self, render: str) -> None:
         if render not in RENDER_INDEX_MAP:
@@ -1153,12 +1441,14 @@ class Video2X:
         except Exception:
             logger.exception("Could not publish the video2x mode to mpv")
 
-    def _reopen_current(self) -> None:
-        """Play the current file again through the hook, from where it was."""
+    def _reload_current(self, pos: float | None = None) -> None:
+        """Play the current file again through the hook, from *pos* - by
+        default from where it is now."""
         try:
             if self._mpv.idle_active:
                 return
-            pos = self._mpv.time_pos
+            if pos is None:
+                pos = self._mpv.time_pos
             index = self._mpv.playlist_pos
             if index is None or index < 0:
                 return
@@ -1222,37 +1512,52 @@ class Video2X:
             # Audio, an image, or something ffprobe cannot read.
             logger.info("video2x: not a video, leaving alone: %r", source)
             return None
-        if source.rotation % 360:
-            idle_add_once(
-                self._win.show_toast,
-                _("video2x: rotated videos are not supported, playing the original"),
-            )
-            return None
 
-        key = cache_key(source, recipe)
-        output, marker = cache_paths(key)
-        if os.path.isfile(marker) and os.path.isfile(output):
-            logger.info("video2x: cache hit for %s (%s)", os.path.basename(path), recipe.key)
-            touch_cache_entry(key)
-            return output
+        live = self.render == RENDER_LIVE
+        decode = self._fit_decode(source, recipe) if live else None
+
+        # A complete render serves any session that would have settled for
+        # its size: the full-size one serves everyone, one decoded smaller a
+        # live session that planned on that size or a little more.
+        for decode_height in self._acceptable_heights(source, decode):
+            key = cache_key(source, recipe, decode_height)
+            output, marker = cache_paths(key)
+            if os.path.isfile(marker) and os.path.isfile(output):
+                logger.info(
+                    "video2x: cache hit for %s (%s%s)",
+                    os.path.basename(path), recipe.key, f" at {decode_height}p" if decode_height else "",
+                )
+                touch_cache_entry(key)
+                return output
+
+        # Where to render from. From the start, so that the result can be
+        # kept - unless this is a live session beginning far enough in that
+        # rendering everything before it would take too long.
+        offset = 0.0
+        if live and start > 0:
+            wait = start / (self._estimated_speed(source, recipe, decode) or 1.0)
+            if wait > LIVE_RESTART_WAIT_SECONDS:
+                offset = max(0.0, start - LIVE_BACKOFF_SECONDS)
 
         # Make room before, and hold the line after: the new render counts
         # against the limit as soon as it is complete.
         self.trim_cache()
-        job = self._start_or_join(install, source, recipe, key)
+        job = self._start_or_join(install, source, recipe, offset, decode)
         job.on_done = self.trim_cache
         idle_add_once(self._show_progress, job)
 
         with self._jobs_lock:
             self._awaited.add(job)
         try:
-            if self.render == RENDER_LIVE:
+            if live:
                 # In a chain this includes the whole of every pass before
                 # the last: only the last one writes the file to be played.
-                # Playback may not begin at zero - a resume, or the file
-                # re-opened after a setting changed - and the render does,
-                # so the lead is measured from where playback will start.
-                lead = start + min(LIVE_LEAD_SECONDS, max(1.0, source.duration * 0.25))
+                # The lead is measured from where playback will begin, which
+                # may be past where the render did - a resume, or the file
+                # re-opened after a setting changed.
+                lead = (start - job.offset) + min(
+                    LIVE_LEAD_SECONDS, max(1.0, source.duration * 0.25)
+                )
                 job.wait(lambda p: job.streaming and job.rendered_seconds() >= lead)
             else:
                 job.wait(lambda p: False)  # until it ends, one way or another
@@ -1260,21 +1565,124 @@ class Video2X:
             with self._jobs_lock:
                 self._awaited.discard(job)
 
-        if job.ok:
-            return output
-        if job.finished:
+        if job.ok and not job.offset:
+            return job.output
+        if job.finished and not job.ok:
             self._report_failure(job)
             return None
-        # Still rendering, with enough of a lead to start playing behind it.
+        # Rendering still, with enough of a lead to play behind it - or a
+        # render from an offset, complete, that still needs the original in
+        # front of it.
         idle_add_once(self._start_following, job)
-        return output
+        return self._live_target(job)
 
-    def _start_or_join(self, install: Install, source: Source, recipe: Recipe, key: str) -> RenderJob:
+    @staticmethod
+    def _live_target(job: RenderJob) -> str:
+        """What mpv opens to play a live render: an EDL.
+
+        mpv's own idea of a growing file's length is however much has been
+        written, so the seek bar would end at the render's frontier. The
+        EDL declares the film's real length, and when the render begins
+        part-way in it puts the original before it, so seeking anywhere
+        works: back into the original, or ahead into the render - where a
+        seek past the frontier simply waits for the frames to arrive.
+        Everything mpv reports about the file still refers to the original.
+        """
+
+        def segment(path: str, start: float, length: float) -> str:
+            # %N% quotes a path of N bytes, however many commas it holds.
+            return "%%%d%%%s,%.3f,%.3f" % (len(path.encode("utf-8")), path, start, length)
+
+        if not job.source.duration > job.offset:
+            return job.output  # no length to declare; the plain file will do
+        parts = ["!no_chapters"]
+        if job.offset:
+            parts.append(segment(job.source.path, 0.0, job.offset))
+        parts.append(segment(job.output, 0.0, job.source.duration - job.offset))
+        return "edl://" + ";".join(parts)
+
+    def _fit_decode(self, source: Source, recipe: Recipe) -> tuple[int, int] | None:
+        """The decode size at which a live render of *source* keeps up.
+
+        From the speed record for the last pass - the one the player reads -
+        and LIVE_HEADROOM. None when the source fits as it is, or when this
+        kind of pass has never been timed here.
+        """
+        stage = recipe.stages[-1]
+        if stage.kind != STAGE_UPSCALE:
+            return None  # see RenderJob.frame_size
+        k = seconds_per_frame_megapixel(stage.kind)
+        if k is None or not source.fps or not source.height:
+            return None
+        in_fps = source.fps * (recipe.interp if len(recipe.stages) > 1 else 1)
+        need_fps = stage.out_fps(in_fps) * LIVE_HEADROOM
+        megapixels = 1.0 / (need_fps * k)
+        aspect = source.width / source.height
+        fits = math.sqrt(megapixels * 1e6 / aspect)
+        if fits >= source.height:
+            return None
+        factor = stage.factor if stage.kind == STAGE_UPSCALE else 1
+        # No smaller than the screen needs, than the models make sense at,
+        # or than half of what the screen can show of the source: below
+        # that the lost detail is plain to see, and pausing is the lesser
+        # evil.
+        screen = self._screen_height or 1080
+        floor = max(
+            LIVE_MIN_DECODE_HEIGHT,
+            min(screen, source.height * factor) // factor,
+            min(screen, source.height) // 2,
+        )
+        height = int(fits) // DECODE_STEP * DECODE_STEP
+        while height < floor:
+            height += DECODE_STEP
+        if height >= source.height:
+            return None
+        return decode_size(source, height * factor, factor)
+
+    @staticmethod
+    def _acceptable_heights(source: Source, decode: tuple[int, int] | None) -> list[int]:
+        """Decode heights whose cached render would do, best first: full
+        size (0), then - when the plan is to decode smaller - every step
+        from just under the source down to a little below the plan."""
+        heights = [0]
+        if decode:
+            top = (source.height - 1) // DECODE_STEP * DECODE_STEP
+            lowest = int(decode[1] * 0.85)
+            heights += list(range(top, lowest - 1, -DECODE_STEP))
+        return heights
+
+    def _estimated_speed(
+        self, source: Source, recipe: Recipe, decode: tuple[int, int] | None
+    ) -> float:
+        """The last pass's speed relative to realtime, as the record
+        predicts; 0 when there is no record."""
+        stage = recipe.stages[-1]
+        width, height = decode or (source.width, source.height)
+        fps = estimated_out_fps(stage.kind, width, height)
+        if not fps:
+            return 0.0
+        in_fps = source.fps * (recipe.interp if len(recipe.stages) > 1 else 1)
+        want = stage.out_fps(in_fps)
+        return fps / want if want else 0.0
+
+    def _start_or_join(
+        self,
+        install: Install,
+        source: Source,
+        recipe: Recipe,
+        offset: float,
+        decode: tuple[int, int] | None,
+    ) -> RenderJob:
+        key = cache_key(source, recipe, decode[1] if decode else 0)
+        stem = partial_stem(key, offset) if offset else key
         with self._jobs_lock:
-            job = self._jobs.get(key)
+            job = self._jobs.get(stem)
             if job is None or job.finished:
-                job = RenderJob(install, source, recipe, stream=self.render == RENDER_LIVE)
-                self._jobs[key] = job
+                job = RenderJob(
+                    install, source, recipe,
+                    stream=self.render == RENDER_LIVE, offset=offset, decode=decode,
+                )
+                self._jobs[stem] = job
                 job.start()
             return job
 
@@ -1336,6 +1744,11 @@ class Video2X:
         p = job.progress
         stage = job.stages[min(p.stage, len(job.stages) - 1)]
         label = stage.label
+        if job.decode:
+            # Decoded smaller to keep up; say what will come out.
+            label = _("%s at %dp") % (
+                label, job.decode[1] * (stage.factor if stage.kind == STAGE_UPSCALE else 1),
+            )
         if len(job.stages) > 1:
             label = _("%s (%d/%d)") % (label, p.stage + 1, len(job.stages))
         if p.phase == "engine":
@@ -1347,8 +1760,7 @@ class Video2X:
             # Speed relative to this pass's own output rate. Its input runs
             # at the source rate, or at the interpolated rate if a pass
             # before it multiplied that.
-            in_fps = job.source.fps * (job.recipe.interp if p.stage > 0 else 1)
-            stage_fps = stage.out_fps(in_fps)
+            stage_fps = stage.out_fps(job.stage_input_fps(p.stage))
             speed = p.out_fps / stage_fps if stage_fps else 0
             if remaining >= 3600:
                 eta = _("%d h %02d min") % divmod(int(remaining // 60), 60)
@@ -1362,44 +1774,62 @@ class Video2X:
     # -- live playback (main loop) ---------------------------------------------
 
     def _start_following(self, job: RenderJob) -> None:
-        logger.info("video2x: live playback starts, %.1f s rendered", job.rendered_seconds())
+        logger.info(
+            "video2x: live playback starts at %.1f, rendered to %.1f", job.offset, job.frontier()
+        )
         self._live = job
         self._live_paused_by_us = False
-        # mpv sees a file that ends where the render has got to; the seek
-        # bar should show where the film ends.
-        if job.source.duration:
-            self._win.set_duration_override(job.source.duration)
         if self._toast is not None and self._toast_job is job:
             self._toast.dismiss()
 
     def _stop_following(self) -> None:
         job, self._live = self._live, None
-        if job is not None:
-            self._win.set_duration_override(None)
         if job is not None and not job.finished and job.stream:
             # Playback has moved on; the render was only for this session.
             # A pre-render is left to finish because it is cached whole.
             job.cancel()
+        if job is not None and job.offset:
+            # A render from an offset is for one sitting, and this was it.
+            self._trim_later()
         self._live_paused_by_us = False
         if self._live_poll_id:
             GLib.source_remove(self._live_poll_id)
             self._live_poll_id = 0
 
     def _follow(self, pos: float) -> None:
+        """Where playback is, in the film's time - or where a seek has asked
+        to go, while mpv waits for those frames to exist."""
         job = self._live
         if job is None:
             return
         self._live_pos = pos
         if job.finished:
-            # The file is complete now and mpv will read it to the end; its
-            # own duration is right again.
+            # The file is complete; mpv will read it to the end. The job
+            # stays here so that what it wrote is kept until playback ends.
             if job.ok:
                 self._resume()
-            self._live = None
-            self._win.set_duration_override(None)
             return
 
-        ahead = job.rendered_seconds() - pos
+        if pos < job.offset:
+            # Before where the render begins: this is the original playing,
+            # from the EDL's first segment, and nothing to wait for.
+            self._resume()
+            return
+
+        ahead = job.frontier() - pos
+        if ahead < 0:
+            # Past the frontier: a seek. mpv holds it until the frames
+            # arrive. If that is a long way off, render from here instead.
+            wait = -ahead / (job.speed() or self._estimated_speed(job.source, job.recipe, job.decode) or 1.0)
+            if wait > LIVE_RESTART_WAIT_SECONDS and time.monotonic() - self._live_restarted_at > 3.0:
+                logger.info(
+                    "video2x: seek to %.1f is %.1f s past the frontier, about %.0f s of "
+                    "rendering away; rendering from there instead", pos, -ahead, wait,
+                )
+                self._live_restarted_at = time.monotonic()
+                self._reload_current(pos)
+                return
+
         if self._live_paused_by_us:
             if ahead >= LIVE_LEAD_SECONDS:
                 logger.info("video2x: render is %.1f s ahead again, resuming at %.1f", ahead, pos)
