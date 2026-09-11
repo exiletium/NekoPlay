@@ -621,3 +621,171 @@ class ProcessTree:
         if self._job:
             ctypes.WinDLL("kernel32").CloseHandle(self._job)
             self._job = None
+
+
+# --- Single instance -------------------------------------------------------
+#
+# On Linux a second `nekoplay file.mp4` hands the file to the running
+# instance over D-Bus and exits: GApplication does it, and it is how the
+# desktop entry (Exec=nekoplay --new-window %U) is meant to work. Windows has
+# no session bus, so GApplication quietly makes every launch a primary and a
+# double-click in Explorer paid for a whole new process and window every
+# time - about a second warm.
+#
+# A named pipe gives both halves of what D-Bus provided. Whoever creates it
+# with FILE_FLAG_FIRST_PIPE_INSTANCE is the primary, atomically; anyone who
+# finds it already there connects, writes its arguments and exits, well
+# before GTK would have started loading. The default pipe ACL lets other
+# users read but not write, so only this user's launches get through.
+
+
+class SingleInstance:
+    """Be the one running instance, or hand this launch's arguments to it."""
+
+    def __init__(self, name: str):
+        # A raw string cannot end in a backslash, hence the odd spelling.
+        self.name = "\\\\.\\pipe\\" + name
+        self._handle = None
+        self._k32 = None
+
+    def _kernel32(self):
+        if self._k32 is None:
+            k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+            k32.CreateNamedPipeW.restype = ctypes.c_void_p
+            k32.CreateNamedPipeW.argtypes = [
+                ctypes.c_wchar_p, ctypes.c_uint, ctypes.c_uint, ctypes.c_uint,
+                ctypes.c_uint, ctypes.c_uint, ctypes.c_uint, ctypes.c_void_p,
+            ]
+            k32.CreateFileW.restype = ctypes.c_void_p
+            k32.CreateFileW.argtypes = [
+                ctypes.c_wchar_p, ctypes.c_uint, ctypes.c_uint, ctypes.c_void_p,
+                ctypes.c_uint, ctypes.c_uint, ctypes.c_void_p,
+            ]
+            k32.WaitNamedPipeW.argtypes = [ctypes.c_wchar_p, ctypes.c_uint]
+            k32.ConnectNamedPipe.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+            k32.DisconnectNamedPipe.argtypes = [ctypes.c_void_p]
+            k32.ReadFile.argtypes = [
+                ctypes.c_void_p, ctypes.c_void_p, ctypes.c_uint,
+                ctypes.POINTER(ctypes.c_uint), ctypes.c_void_p,
+            ]
+            k32.WriteFile.argtypes = [
+                ctypes.c_void_p, ctypes.c_void_p, ctypes.c_uint,
+                ctypes.POINTER(ctypes.c_uint), ctypes.c_void_p,
+            ]
+            k32.CloseHandle.argtypes = [ctypes.c_void_p]
+            self._k32 = k32
+        return self._k32
+
+    # -- election -----------------------------------------------------------
+
+    def claim(self) -> bool:
+        """Try to become the primary. True if we are; False if one exists."""
+        PIPE_ACCESS_INBOUND = 0x00000001
+        FILE_FLAG_FIRST_PIPE_INSTANCE = 0x00080000
+        PIPE_TYPE_MESSAGE = 0x00000004
+        PIPE_READMODE_MESSAGE = 0x00000002
+        PIPE_WAIT = 0x00000000
+        INVALID_HANDLE_VALUE = ctypes.c_void_p(-1).value
+
+        k32 = self._kernel32()
+        handle = k32.CreateNamedPipeW(
+            self.name,
+            PIPE_ACCESS_INBOUND | FILE_FLAG_FIRST_PIPE_INSTANCE,
+            PIPE_TYPE_MESSAGE | PIPE_READMODE_MESSAGE | PIPE_WAIT,
+            1,  # one instance: launches are rare and served in turn
+            0,
+            65536,
+            0,
+            None,
+        )
+        if handle is None or handle == INVALID_HANDLE_VALUE:
+            # "Someone already has this name" arrives as ERROR_PIPE_BUSY (231)
+            # when the one allowed instance exists, or ERROR_ACCESS_DENIED (5)
+            # from the first-instance flag; measured here, it is 231. Anything
+            # else is a surprise, and running standalone is the safe reaction.
+            error = ctypes.get_last_error()
+            if error in (5, 231):
+                return False
+            logger.warning("CreateNamedPipe failed (%d); running standalone", error)
+            return True
+        self._handle = handle
+        return True
+
+    def forward(self, payload: bytes, timeout_ms: int = 3000) -> bool:
+        """Deliver *payload* to the primary. True if it was written."""
+        GENERIC_WRITE = 0x40000000
+        OPEN_EXISTING = 3
+        INVALID_HANDLE_VALUE = ctypes.c_void_p(-1).value
+        ERROR_PIPE_BUSY = 231
+
+        k32 = self._kernel32()
+        deadline_tries = 3
+        while True:
+            handle = k32.CreateFileW(
+                self.name, GENERIC_WRITE, 0, None, OPEN_EXISTING, 0, None
+            )
+            if handle is not None and handle != INVALID_HANDLE_VALUE:
+                break
+            error = ctypes.get_last_error()
+            deadline_tries -= 1
+            if error == ERROR_PIPE_BUSY and deadline_tries > 0:
+                # Another launch is being served; wait for our turn.
+                k32.WaitNamedPipeW(self.name, timeout_ms)
+                continue
+            return False
+
+        try:
+            written = ctypes.c_uint(0)
+            ok = k32.WriteFile(handle, payload, len(payload), ctypes.byref(written), None)
+            return bool(ok) and written.value == len(payload)
+        finally:
+            k32.CloseHandle(handle)
+
+    # -- serving --------------------------------------------------------------
+
+    def serve(self, callback) -> None:
+        """Start handing each forwarded launch to *callback(bytes)*.
+
+        Runs on its own thread; the callback is invoked there and must
+        marshal to the main loop itself.
+        """
+        if self._handle is None:
+            return
+        import threading
+
+        threading.Thread(
+            target=self._serve, args=(callback,), name="single-instance", daemon=True
+        ).start()
+
+    def _serve(self, callback) -> None:
+        ERROR_PIPE_CONNECTED = 535
+        ERROR_MORE_DATA = 234
+        k32 = self._kernel32()
+        buffer = ctypes.create_string_buffer(65536)
+        while True:
+            if not k32.ConnectNamedPipe(self._handle, None):
+                if ctypes.get_last_error() != ERROR_PIPE_CONNECTED:
+                    # The handle is gone; nothing more to serve.
+                    if ctypes.get_last_error() in (6, 232):  # INVALID_HANDLE, NO_DATA
+                        return
+                    logger.debug("ConnectNamedPipe failed (%d)", ctypes.get_last_error())
+                    continue
+            try:
+                message = b""
+                while True:
+                    read = ctypes.c_uint(0)
+                    ok = k32.ReadFile(
+                        self._handle, buffer, len(buffer), ctypes.byref(read), None
+                    )
+                    message += buffer.raw[: read.value]
+                    if ok:
+                        break
+                    if ctypes.get_last_error() != ERROR_MORE_DATA:
+                        break
+                if message:
+                    try:
+                        callback(message)
+                    except Exception:
+                        logger.exception("Forwarded launch could not be handled")
+            finally:
+                k32.DisconnectNamedPipe(self._handle)

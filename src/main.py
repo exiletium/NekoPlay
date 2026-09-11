@@ -61,12 +61,15 @@ else:
 class CineApplication(Adw.Application):
     """The main application singleton class."""
 
-    def __init__(self):
+    def __init__(self, single_instance=None):
         super().__init__(
             application_id="moe.nyarchlinux.nekoplay",
             flags=Gio.ApplicationFlags.HANDLES_OPEN,
             resource_base_path="/moe/nyarchlinux/nekoplay",
         )
+        # The named pipe claimed in nekoplay.in, if this is Windows and we
+        # are the primary; served once startup is done.
+        self._single_instance = single_instance
 
         self.add_main_option(
             "new-window",
@@ -137,7 +140,38 @@ class CineApplication(Adw.Application):
             "preferences", self.on_preferences_action, ["<primary>comma"]
         )
 
+        if self._single_instance is not None:
+            self._single_instance.serve(self._on_forwarded_launch)
+
         trace("app started")
+
+    def _on_forwarded_launch(self, payload: bytes) -> None:
+        """A second launch sent us its arguments (pipe thread)."""
+        import json
+
+        try:
+            message = json.loads(payload.decode("utf-8"))
+            cwd = str(message.get("cwd") or "")
+            argv = [str(a) for a in message.get("argv") or []]
+        except (ValueError, AttributeError):
+            logger.warning("Ignoring a malformed forwarded launch")
+            return
+        GLib.idle_add(self._open_forwarded, argv, cwd)
+
+    def _open_forwarded(self, argv: list, cwd: str) -> bool:
+        """Main loop: what GApplication does for a remote launch on Linux."""
+        files = [
+            Gio.File.new_for_commandline_arg_and_cwd(arg, cwd)
+            for arg in argv
+            if not arg.startswith("-")
+        ]
+        if files:
+            self.open(files, "")
+        elif "--new-window" in argv or "-n" in argv:
+            self.activate()
+        else:
+            print("NekoPlay is running; to open a new window, use --new-window.")
+        return False
 
     def do_activate(self):
         win = CineWindow(application=self, is_activate=True)
@@ -327,7 +361,7 @@ class CineApplication(Adw.Application):
             win.close()
 
 
-def main(version):
+def main(version, single_instance=None):
     """The application's entry point."""
-    app = CineApplication()
+    app = CineApplication(single_instance)
     return app.run(sys.argv)

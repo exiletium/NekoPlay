@@ -1365,11 +1365,17 @@ class Video2X:
         logger.info("video2x: live playback starts, %.1f s rendered", job.rendered_seconds())
         self._live = job
         self._live_paused_by_us = False
+        # mpv sees a file that ends where the render has got to; the seek
+        # bar should show where the film ends.
+        if job.source.duration:
+            self._win.set_duration_override(job.source.duration)
         if self._toast is not None and self._toast_job is job:
             self._toast.dismiss()
 
     def _stop_following(self) -> None:
         job, self._live = self._live, None
+        if job is not None:
+            self._win.set_duration_override(None)
         if job is not None and not job.finished and job.stream:
             # Playback has moved on; the render was only for this session.
             # A pre-render is left to finish because it is cached whole.
@@ -1385,10 +1391,12 @@ class Video2X:
             return
         self._live_pos = pos
         if job.finished:
-            # The file is complete now and mpv will read it to the end.
+            # The file is complete now and mpv will read it to the end; its
+            # own duration is right again.
             if job.ok:
                 self._resume()
             self._live = None
+            self._win.set_duration_override(None)
             return
 
         ahead = job.rendered_seconds() - pos

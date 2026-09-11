@@ -147,6 +147,35 @@ exists. To see which renderer you got:
 GSK_DEBUG=renderer nekoplay.exe
 ```
 
+## One instance, like on Linux
+
+On Linux a second `nekoplay --new-window file.mp4` hands the file to the
+running instance over D-Bus and exits; the desktop entry is written that
+way, and `do_open` then decides between a new window and the current one
+from the "Open New Window for New Files" preference. Windows has no session
+bus, so GApplication quietly made every launch a primary: every double-click
+in Explorer was a whole new process and window, about a second warm.
+
+`platform_compat.SingleInstance` does both halves with a named pipe,
+`\\.\pipe\NekoPlay-<user>`. Whoever creates it first is the primary (the
+one allowed instance makes the election atomic - the loser gets
+`ERROR_PIPE_BUSY`); anyone else connects, writes `{"cwd", "argv"}` as JSON
+and exits, at about 80 ms, before GTK would have started loading. That
+happens at the top of `nekoplay.in`, before the log file is even opened, so
+a forwarding launch never truncates the running instance's log. The primary
+serves the pipe from `do_startup` and turns each message into what
+GApplication would have done: `open()` for files, `activate()` for
+`--new-window`, upstream's "NekoPlay is running" message otherwise - except
+that the bare exe with no arguments counts as `--new-window`, because on
+Windows the exe is the thing the user clicks. The installer's shortcuts and
+file association pass `--new-window`, as the desktop entry does. Only
+writes by this user reach the primary: the default pipe ACL gives other
+users read access only.
+
+Measured: the second launch exits in ~150 ms and the file is playing in the
+primary ~40 ms after it arrives, in a new window or the current one
+according to the preference.
+
 ## Black frames, and where the rounded corners come from
 
 GTK draws client-side decorations and popovers on the assumption that the
@@ -211,7 +240,10 @@ Two timings, in Preferences under **AI Render Timing**:
   waits in the same way. Two things make this work: mpv follows a growing
   file as long as it never reads to the end (`--stream` makes the muxer
   flush every second), and if it does hit EOF, a seek to the same position
-  makes the demuxer look again.
+  makes the demuxer look again. mpv's own duration for a growing file is
+  only what has been written, so while a live render runs the window shows
+  the source's length instead (`set_duration_override`), and mpv's value
+  again once the render completes.
 
 Measured on a 608×1080 30 fps clip on an RX 9060 XT: interpolate 2× runs at
 4.0× realtime, upscale ×4 (to 2432×4320) at 0.88× - so live upscaling of
@@ -233,6 +265,16 @@ the pipeline's decoder would autorotate them into the wrong shape. A render
 left running when the window closes is killed with everything it spawned -
 a Windows Job Object flagged kill-on-close, so this holds even if the app
 dies.
+
+## Looping
+
+`NEKOPLAY_TRACE=1` also times loops: with loop-file on, each wrap prints the
+wall time between wraps minus the clip length. It only listens to the
+time-pos observer, because an earlier probe that read properties
+synchronously from the main loop every 2 ms measured its own interference
+(+187 ms) and nothing else. Measured over five loops of a 15 s clip: median
+-45 ms, i.e. the wrap lands inside the last frame (42 ms at 24 fps) with no
+stall; bare mpv on the same content gives -16 ms.
 
 ## What still costs more than mpv, and why
 

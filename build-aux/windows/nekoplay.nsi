@@ -133,10 +133,13 @@ Section "${APP_NAME}" SecCore
   ; The player itself, for the Open With list and the association section.
   WriteRegStr HKLM "Software\Classes\${PROGID}" "" "Video"
   WriteRegStr HKLM "Software\Classes\${PROGID}\DefaultIcon" "" "$INSTDIR\${APP_EXE},0"
-  WriteRegStr HKLM "Software\Classes\${PROGID}\shell\open\command" "" '"$INSTDIR\${APP_EXE}" "%1"'
-  WriteRegStr HKLM "Software\Classes\Applications\${APP_EXE}\shell\open\command" "" '"$INSTDIR\${APP_EXE}" "%1"'
+  ; Same arguments as the Linux desktop entry (Exec=nekoplay --new-window %U):
+  ; a running instance then opens the file according to the
+  ; "Open New Window for New Files" preference instead of ignoring it.
+  WriteRegStr HKLM "Software\Classes\${PROGID}\shell\open\command" "" '"$INSTDIR\${APP_EXE}" --new-window "%1"'
+  WriteRegStr HKLM "Software\Classes\Applications\${APP_EXE}\shell\open\command" "" '"$INSTDIR\${APP_EXE}" --new-window "%1"'
 
-  CreateShortcut "$SMPROGRAMS\${APP_NAME}.lnk" "$INSTDIR\${APP_EXE}"
+  CreateShortcut "$SMPROGRAMS\${APP_NAME}.lnk" "$INSTDIR\${APP_EXE}" "--new-window"
 
   WriteUninstaller "$INSTDIR\Uninstall.exe"
 
@@ -157,7 +160,7 @@ Section "${APP_NAME}" SecCore
 SectionEnd
 
 Section "Desktop shortcut" SecDesktop
-  CreateShortcut "$DESKTOP\${APP_NAME}.lnk" "$INSTDIR\${APP_EXE}"
+  CreateShortcut "$DESKTOP\${APP_NAME}.lnk" "$INSTDIR\${APP_EXE}" "--new-window"
 SectionEnd
 
 Section "Offer to open video files" SecAssoc

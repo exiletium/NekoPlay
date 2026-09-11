@@ -56,9 +56,39 @@ if os.name == 'nt':
     if os.path.isdir(bindir):
         os.add_dll_directory(bindir)
 
+sys.path.insert(1, pkgdatadir)
+
+from cine.platform_compat import TRACE, trace, _T0  # noqa: E402
+
+# On Linux GApplication hands a second launch's files to the running
+# instance over D-Bus; Windows has no bus, so it is done here with a named
+# pipe - and done now, because the whole point is to exit before GTK loads.
+# main.py serves the other end once the app is up. A launch with nothing to
+# open and no --new-window is the one case upstream leaves alone; the bare
+# exe is what a Windows user clicks, so it counts as --new-window here.
+SINGLE_INSTANCE = None
+if os.name == 'nt':
+    import getpass
+    import json
+
+    from cine.platform_compat import SingleInstance
+
+    SINGLE_INSTANCE = SingleInstance('NekoPlay-' + getpass.getuser())
+    if not SINGLE_INSTANCE.claim():
+        _args = sys.argv[1:]
+        _payload = json.dumps({'cwd': os.getcwd(), 'argv': _args or ['--new-window']})
+        if SINGLE_INSTANCE.forward(_payload.encode('utf-8')):
+            sys.exit(0)
+        # It went away between our two calls; carry on as the primary.
+        SINGLE_INSTANCE.claim()
+    _mark('primary instance')
+
+if os.name == 'nt':
     # Built against the GUI subsystem, so there are no standard streams to
     # inherit and every print() in the app would raise. A log file next to
     # the settings is more use than os.devnull when a user reports a crash.
+    # Only the primary gets here; a forwarding launch has exited above,
+    # before it could truncate the running instance's log.
     if sys.stdout is None or sys.stderr is None:
         try:
             log_dir = os.path.join(
@@ -166,10 +196,7 @@ if os.name == 'nt':
         if added != len(files):
             print(f'Registered {added} of {len(files)} bundled fonts')
 
-sys.path.insert(1, pkgdatadir)
 signal.signal(signal.SIGINT, signal.SIG_DFL)
-
-from cine.platform_compat import TRACE, trace, _T0  # noqa: E402
 
 if TRACE:
     for _label, _at in _early:
@@ -285,4 +312,4 @@ if __name__ == '__main__':
     from cine import main
 
     trace('app modules imported')
-    sys.exit(main.main(VERSION))
+    sys.exit(main.main(VERSION, SINGLE_INSTANCE))
