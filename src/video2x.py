@@ -40,9 +40,12 @@ Two ways to wait for the render:
   been rendered waits too, because the render is sequential.
 
 Rendered files are cached under the config directory, keyed by the source
-file and the mode, so a file is rendered once. Engines are per-resolution;
-one that is missing is built on the spot when the video2x install has
-PyTorch, which takes seconds for an upscaler and a minute or two for RIFE.
+file and the mode, so a file is rendered once. Engines are per-resolution.
+A missing one is built on the spot: recent video2x_optimized re-targets an
+engine it already has, inside the render command, in a fraction of a second
+and without PyTorch. Older installs fall back to a real export from the
+weights, which needs torch and takes seconds for an upscaler or a minute or
+two for RIFE, and is shown as its own "engine" phase.
 """
 
 from __future__ import annotations
@@ -128,6 +131,7 @@ class Install:
     ffmpeg_dir: str | None = None
     problem: str | None = None
     _can_export: bool | None = field(default=None, repr=False)
+    _can_autobuild: bool | None = field(default=None, repr=False)
 
     @property
     def usable(self) -> bool:
@@ -149,6 +153,26 @@ class Install:
                 self.python, "torch, onnx"
             )
         return self._can_export
+
+    @property
+    def can_autobuild(self) -> bool:
+        """Whether video2x builds a missing engine by itself.
+
+        Recent video2x_optimized re-targets an engine it already has to the
+        new resolution -- regenerating the few tensors that encode the
+        resolution with numpy -- rather than re-exporting from the weights.
+        That needs onnx but not torch, takes a fraction of a second, and
+        happens inside the render command, so there is nothing to pre-build
+        and no separate "engine" phase to show.
+
+        Probed in the install's own root because video2x_opt is imported from
+        there rather than installed.
+        """
+        if self._can_autobuild is None:
+            self._can_autobuild = bool(self.python) and _python_has(
+                self.python, "onnx, video2x_opt.onnx_respec", cwd=self.root
+            )
+        return self._can_autobuild
 
     def engine_path(self, mode: str, width: int, height: int) -> str:
         if mode == MODE_UPSCALE:
@@ -238,11 +262,12 @@ def _foreign_python_env() -> dict[str, str]:
     return env
 
 
-def _python_has(python: str, module: str) -> bool:
+def _python_has(python: str, module: str, cwd: str | None = None) -> bool:
     try:
         return (
             subprocess.run(
                 [python, "-c", f"import {module}"],
+                cwd=cwd,
                 env=_foreign_python_env(),
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
@@ -722,18 +747,26 @@ class RenderJob(threading.Thread):
         src = self.source
 
         if not self.install.has_engine(self.mode, src.width, src.height):
-            if not self.install.can_export:
+            if self.install.can_autobuild:
+                # The render command builds it as it starts, in well under a
+                # second. Nothing to do here, and no phase worth showing.
+                logger.info(
+                    "no %s engine for %dx%d; video2x will build one",
+                    self.mode, src.width, src.height,
+                )
+            elif self.install.can_export:
+                self._set(phase="engine")
+                if not self._run_child(self.install.export_command(self.mode, src.width, src.height), None):
+                    return
+                if not self.install.has_engine(self.mode, src.width, src.height):
+                    self._set(phase="failed", error=_("Building the engine produced no file."))
+                    return
+            else:
                 self._set(
                     phase="failed",
-                    error=_("No engine for %dx%d, and this video2x install cannot build one (it needs PyTorch).")
+                    error=_("No engine for %dx%d, and this video2x install cannot build one.")
                     % (src.width, src.height),
                 )
-                return
-            self._set(phase="engine")
-            if not self._run_child(self.install.export_command(self.mode, src.width, src.height), None):
-                return
-            if not self.install.has_engine(self.mode, src.width, src.height):
-                self._set(phase="failed", error=_("Building the engine produced no file."))
                 return
 
         # Anything left over from a run that did not finish.
