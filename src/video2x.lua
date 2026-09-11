@@ -47,8 +47,9 @@ end)
 
 mp.add_hook("on_load", 50, function(hook)
     -- Set by the app, so that with the feature off this costs one property
-    -- read and no round trip.
-    if mp.get_property("user-data/video2x/mode", "off") == "off" then
+    -- read and no round trip. The native read matters: the string form of
+    -- a user-data node is its JSON, quotes included, and never equals off.
+    if mp.get_property_native("user-data/video2x/mode", "off") == "off" then
         return
     end
 
