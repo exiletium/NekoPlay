@@ -31,7 +31,6 @@ gi.require_version("Gtk", "4.0")
 from gi.repository import Adw, Gdk, Gio, GLib, Gtk
 
 from . import video2x
-from .anime4k import MODE_INDEX_MAP, MODE_TO_INDEX, apply_anime4k_shaders
 from .utils import CONFIG_DIR, display, has_host_permission, is_flatpak
 
 logger = logging.getLogger(__name__)
@@ -74,9 +73,6 @@ def sync_mpv_with_settings(window):
     elif loop == "file":
         mpv.loop_file = "inf"
 
-    # Apply the configured Anime4K preset while preserving other shaders.
-    anime4k_mode = settings.get_string("anime4k-mode")
-    apply_anime4k_shaders(mpv, anime4k_mode)
 
 
 @Gtk.Template(resource_path="/moe/nyarchlinux/nekoplay/preferences.ui")
@@ -107,8 +103,8 @@ class Preferences(Adw.Dialog):
     subtitle_bg_switch: Gtk.Switch = Gtk.Template.Child()
     subtitle_lang_row: Adw.EntryRow = Gtk.Template.Child()
     audio_lang_row: Adw.EntryRow = Gtk.Template.Child()
-    anime4k_mode_row: Adw.ComboRow = Gtk.Template.Child()
-    video2x_mode_row: Adw.ComboRow = Gtk.Template.Child()
+    video2x_upscale_row: Adw.ComboRow = Gtk.Template.Child()
+    video2x_interp_row: Adw.ComboRow = Gtk.Template.Child()
     video2x_render_row: Adw.ComboRow = Gtk.Template.Child()
     video2x_path_row: Adw.ActionRow = Gtk.Template.Child()
     video2x_path_btn: Gtk.Button = Gtk.Template.Child()
@@ -129,14 +125,6 @@ class Preferences(Adw.Dialog):
 
         self.sub_color_btn.connect("notify::rgba", self._on_sub_color_selected)
         self.reset_sub_color.connect("clicked", self._on_sub_color_reset)
-
-        # Initialize Anime4K combo rows from GSettings
-        anime4k_mode = settings.get_string("anime4k-mode")
-        mode_idx = MODE_TO_INDEX.get(anime4k_mode, 0)
-        self.anime4k_mode_row.set_selected(mode_idx)
-        self.anime4k_mode_row.connect(
-            "notify::selected", self._on_anime4k_mode_ui_changed
-        )
 
         self._setup_video2x_rows()
         self.font_row.connect("activated", self._on_font_activated)
@@ -199,7 +187,6 @@ class Preferences(Adw.Dialog):
             "hwdec": self._on_hwdec_changed,
             "normalize-volume": self._on_norm_volume_changed,
             "save-video-position": self._on_save_pos_changed,
-            "anime4k-mode": self._on_anime4k_mode_setting_changed,
         }
 
         self._setting_ids = [
@@ -285,9 +272,11 @@ class Preferences(Adw.Dialog):
     # --- video2x ---
     def _setup_video2x_rows(self):
         v2x = self._win.video2x
-        self.video2x_mode_row.set_selected(video2x.MODE_TO_INDEX.get(v2x.mode, 0))
+        self.video2x_upscale_row.set_selected(video2x.UPSCALE_TO_INDEX.get(v2x.upscale, 0))
+        self.video2x_interp_row.set_selected(video2x.INTERP_TO_INDEX.get(v2x.interp, 0))
         self.video2x_render_row.set_selected(video2x.RENDER_TO_INDEX.get(v2x.render, 0))
-        self.video2x_mode_row.connect("notify::selected", self._on_video2x_mode_ui_changed)
+        self.video2x_upscale_row.connect("notify::selected", self._on_video2x_upscale_ui_changed)
+        self.video2x_interp_row.connect("notify::selected", self._on_video2x_interp_ui_changed)
         self.video2x_render_row.connect(
             "notify::selected", self._on_video2x_render_ui_changed
         )
@@ -313,14 +302,23 @@ class Preferences(Adw.Dialog):
             self.video2x_cache_row.set_subtitle(_("Empty"))
         self.video2x_cache_btn.set_sensitive(bool(size))
 
-    def _on_video2x_mode_ui_changed(self, row, *a):
+    def _on_video2x_upscale_ui_changed(self, row, *a):
         idx = row.get_selected()
-        mode = (
-            video2x.MODE_INDEX_MAP[idx]
-            if idx < len(video2x.MODE_INDEX_MAP)
-            else video2x.MODE_OFF
+        value = (
+            video2x.UPSCALE_INDEX_MAP[idx]
+            if idx < len(video2x.UPSCALE_INDEX_MAP)
+            else video2x.UPSCALE_OFF
         )
-        self._win.video2x.set_mode(mode)
+        self._win.video2x.set_upscale(value)
+
+    def _on_video2x_interp_ui_changed(self, row, *a):
+        idx = row.get_selected()
+        value = (
+            video2x.INTERP_INDEX_MAP[idx]
+            if idx < len(video2x.INTERP_INDEX_MAP)
+            else video2x.INTERP_OFF
+        )
+        self._win.video2x.set_interp(value)
 
     def _on_video2x_render_ui_changed(self, row, *a):
         idx = row.get_selected()
@@ -365,15 +363,6 @@ class Preferences(Adw.Dialog):
         freed = video2x.clear_cache()
         self._refresh_video2x_rows()
         self._win.show_toast(_("Freed %s") % GLib.format_size(freed))
-
-    def _on_anime4k_mode_ui_changed(self, row, *a):
-        idx = row.get_selected()
-        mode = MODE_INDEX_MAP[idx] if idx < len(MODE_INDEX_MAP) else "off"
-        settings.set_string("anime4k-mode", mode)
-
-    def _on_anime4k_mode_setting_changed(self, settings, _key):
-        mode = settings.get_string("anime4k-mode")
-        apply_anime4k_shaders(self._mpv, mode)
 
     def _on_sub_color_selected(self, color_btn, *arg):
         rgba = color_btn.get_rgba()

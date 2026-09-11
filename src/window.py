@@ -36,7 +36,6 @@ gi.require_version("Gtk", "4.0")
 gi.require_version("GObject", "2.0")
 from gi.repository import Adw, Gdk, Gio, GLib, GObject, Gtk
 
-from .anime4k import apply_anime4k_shaders
 from .video2x import Video2X
 from .history import HistoryDialog
 from .mpris import MPRIS
@@ -48,6 +47,7 @@ from .platform_compat import (
     round_window_corners,
     inhibit_idle,
     is_document_portal_path,
+    strip_popover_arrows,
     TRACE,
     trace,
     uninhibit_idle,
@@ -289,6 +289,7 @@ class CineWindow(Adw.ApplicationWindow):
 
         self._setup_actions()
         self._setup_widgets()
+        strip_popover_arrows(self)
         self._setup_observers()
         self.video2x = Video2X(self, settings)
 
@@ -772,6 +773,7 @@ class CineWindow(Adw.ApplicationWindow):
         if self.mpv.idle_active:
             return
         playlist = Playlist(self)
+        strip_popover_arrows(playlist)
         playlist.present(self)
 
     def on_open_folder_dialog(self, action, *args):
@@ -1493,20 +1495,6 @@ class CineWindow(Adw.ApplicationWindow):
             self.hide_ui_timeout(s=3)
             self._set_space_holding(False)
             return
-
-        if event_type == "keypress" and state & Gdk.ModifierType.CONTROL_MASK:
-            anime4k_mode = {"0": "off", "1": "a", "2": "b", "3": "c"}.get(key_name)
-            if anime4k_mode is not None:
-                settings.set_string("anime4k-mode", anime4k_mode)
-                apply_anime4k_shaders(self.mpv, anime4k_mode)
-                mode_labels = {
-                    "off": _("Upscale: Off"),
-                    "a": _("Upscale: 1080p Anime"),
-                    "b": _("Upscale: 720p Anime"),
-                    "c": _("Upscale: 480p Anime"),
-                }
-                self.mpv.show_text(mode_labels[anime4k_mode])
-                return True
 
         clean_state = state & Gtk.accelerator_get_default_mod_mask()
         accel = Gtk.accelerator_name(keyval, clean_state)

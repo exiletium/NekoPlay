@@ -22,11 +22,9 @@ INSTALL_DIR="${INSTALL_DIR:-$SRC_ROOT/_install}"
 DIST="${DIST:-$SRC_ROOT/dist/NekoPlay}"
 PYVER="$(python -c 'import sys; print("%d.%d" % sys.version_info[:2])')"
 
-WITH_ANIME4K=0
 WITH_VIDEO2X=""
 for arg in "$@"; do
 	case "$arg" in
-	--with-anime4k) WITH_ANIME4K=1 ;;
 	# A video2x_optimized portable bundle (the folder holding video2x.bat)
 	# to ship inside the app, so AI upscaling works without any setup.
 	--with-video2x=*) WITH_VIDEO2X="${arg#--with-video2x=}" ;;
@@ -221,26 +219,6 @@ cat > "$DIST/etc/fonts/conf.d/99-nekoplay-fonts.conf" <<'FONTCONF'
   </match>
 </fontconfig>
 FONTCONF
-
-# --- Anime4K ---------------------------------------------------------------
-
-if [ "$WITH_ANIME4K" = 1 ]; then
-	say "Fetching Anime4K shaders"
-	# Same release and checksum the Flatpak manifest pins.
-	A4K_URL="https://github.com/bloc97/Anime4K/releases/download/v4.0.1/Anime4K_v4.0.zip"
-	A4K_SHA="139cd282086457c5adc79caf7b75b8b825091d71c9b54958c18745fea62d7ed7"
-	tmp="$(mktemp -d)"
-	curl -fsSL "$A4K_URL" -o "$tmp/anime4k.zip"
-	echo "$A4K_SHA  $tmp/anime4k.zip" | sha256sum -c -
-	mkdir -p "$DIST/share/cine/shaders"
-	# python rather than unzip, which is not in a default MSYS2 install.
-	python -m zipfile -e "$tmp/anime4k.zip" "$tmp/x"
-	find "$tmp/x" -name '*.glsl' -exec cp {} "$DIST/share/cine/shaders/" \;
-	rm -rf "$tmp"
-	say "  $(find "$DIST/share/cine/shaders" -name '*.glsl' | wc -l) shaders"
-else
-	echo "  skipping Anime4K shaders (pass --with-anime4k to include them)"
-fi
 
 # --- video2x_optimized ------------------------------------------------------
 #

@@ -66,16 +66,17 @@
 		<key name="loop-state" enum="moe.nyarchlinux.nekoplay.LoopState">
 			<default>'off'</default>
 		</key>
-		<key name="anime4k-mode" type="s">
-			<default>"off"</default>
-		</key>
 		<key name="video2x-path" type="s">
 			<default>""</default>
 			<summary>Folder holding video2x_optimized</summary>
 		</key>
-		<key name="video2x-mode" type="s">
+		<key name="video2x-upscale" type="s">
 			<default>"off"</default>
-			<summary>off, upscale, interp2 or interp4</summary>
+			<summary>off or x4: upscale with Real-ESRGAN through video2x_optimized</summary>
+		</key>
+		<key name="video2x-interp" type="s">
+			<default>"off"</default>
+			<summary>off, 2x or 4x: interpolate frames with RIFE through video2x_optimized</summary>
 		</key>
 		<key name="video2x-render" type="s">
 			<default>"pre"</default>

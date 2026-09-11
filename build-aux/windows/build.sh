@@ -24,4 +24,4 @@ meson install -C "$BUILD_DIR"
 
 echo
 echo "Installed to $INSTALL_DIR"
-echo "Next: ./build-aux/windows/bundle.sh --with-anime4k"
+echo "Next: ./build-aux/windows/bundle.sh [--with-video2x=DIR]"

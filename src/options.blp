@@ -30,7 +30,7 @@ template $OptionsMenuButton: MenuButton {
           }
         }
 
-        // --- UPSCALE (ANIME4K) ---
+        // --- UPSCALE (VIDEO2X) ---
         Box {
           Box {
             halign: start;
@@ -47,7 +47,7 @@ template $OptionsMenuButton: MenuButton {
             }
 
             Label {
-              label: _("Upscale (Anime4K)");
+              label: _("Upscale (video2x)");
               wrap: true;
               natural-wrap-mode: none;
               halign: start;
@@ -73,9 +73,7 @@ template $OptionsMenuButton: MenuButton {
             model: Gtk.StringList upscale_list {
               strings [
                 _("Off"),
-                _("1080p Anime"),
-                _("720p Anime"),
-                _("480p Anime"),
+                _("×4"),
               ]
             };
 
@@ -83,24 +81,24 @@ template $OptionsMenuButton: MenuButton {
           }
         }
 
-        // --- AI RENDER (VIDEO2X) ---
+        // --- FRAME INTERPOLATION (VIDEO2X) ---
         Box {
           Box {
             halign: start;
 
             Button {
               icon-name: "edit-undo-symbolic";
-              tooltip-text: _("Reset AI Render");
+              tooltip-text: _("Reset Frame Interpolation");
 
               styles [
                 "flat",
               ]
 
-              clicked => $_on_video2x_reset();
+              clicked => $_on_interp_reset();
             }
 
             Label {
-              label: _("AI Render (video2x)");
+              label: _("Frame Interpolation");
               wrap: true;
               natural-wrap-mode: none;
               halign: start;
@@ -118,38 +116,72 @@ template $OptionsMenuButton: MenuButton {
             margin-end: 2;
           }
 
-          Gtk.DropDown video2x_render_dropdown {
+          Gtk.DropDown interp_dropdown {
             halign: end;
-            width-request: 96;
-            margin-end: 6;
+            width-request: 108;
+            focus-on-click: false;
+
+            model: Gtk.StringList interp_list {
+              strings [
+                _("Off"),
+                _("2×"),
+                _("4×"),
+              ]
+            };
+
+            notify::selected => $_on_interp_changed();
+          }
+        }
+
+        // --- AI RENDER TIMING (VIDEO2X) ---
+        Box {
+          Box {
+            halign: start;
+
+            Button {
+              icon-name: "edit-undo-symbolic";
+              tooltip-text: _("Reset Render Timing");
+
+              styles [
+                "flat",
+              ]
+
+              clicked => $_on_render_timing_reset();
+            }
+
+            Label {
+              label: _("AI Render Timing");
+              wrap: true;
+              natural-wrap-mode: none;
+              halign: start;
+              margin-start: 8;
+
+              styles [
+                "heading",
+              ]
+            }
+          }
+
+          Separator {
+            hexpand: true;
+            opacity: 0;
+            margin-end: 2;
+          }
+
+          Gtk.DropDown render_timing_dropdown {
+            halign: end;
+            width-request: 108;
             focus-on-click: false;
             tooltip-text: _("Render the whole file before playing, or play while it renders");
 
-            model: Gtk.StringList video2x_render_list {
+            model: Gtk.StringList render_timing_list {
               strings [
                 _("Pre-render"),
                 _("Live"),
               ]
             };
 
-            notify::selected => $_on_video2x_render_changed();
-          }
-
-          Gtk.DropDown video2x_mode_dropdown {
-            halign: end;
-            width-request: 108;
-            focus-on-click: false;
-
-            model: Gtk.StringList video2x_mode_list {
-              strings [
-                _("Off"),
-                _("Upscale ×4"),
-                _("Interpolate 2×"),
-                _("Interpolate 4×"),
-              ]
-            };
-
-            notify::selected => $_on_video2x_mode_changed();
+            notify::selected => $_on_render_timing_changed();
           }
         }
 

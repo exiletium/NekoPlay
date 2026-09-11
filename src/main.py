@@ -34,7 +34,7 @@ from gi.repository import Adw, Gdk, Gio, GLib, Gtk
 
 from . import probe
 from .mpris import MPRIS
-from .platform_compat import IS_WINDOWS, trace
+from .platform_compat import IS_WINDOWS, round_new_windows, trace
 from .preferences import Preferences, settings
 from .save_session import is_same_playlist
 from .window import CineWindow
@@ -80,11 +80,13 @@ class CineApplication(Adw.Application):
         self.connect("shutdown", self._on_shutdown)
 
     # GTK reserves a margin around a client-side-decorated window for its drop
-    # shadow, and expects the toplevel to have an alpha channel so the margin
-    # stays invisible. Windows toplevels do not get one, so that margin paints
-    # solid black and the window sits inside a thick black frame. Dropping the
-    # shadow and the rounded corners removes it; Windows 11 rounds window
-    # corners itself, so the result still looks right.
+    # shadow, and expects the surface to have an alpha channel so the margin
+    # stays invisible. Windows surfaces do not get one, so that margin paints
+    # solid black and the window sits inside a thick black frame. The same
+    # goes for every popover, menu and dropdown list, each of which is a
+    # surface of its own. Dropping the shadows removes the frames; the
+    # rounded corners come back from DWM, asked for per window in
+    # platform_compat (round_window_corners, round_new_windows).
     WINDOWS_CSS = b"""
     window.csd {
       box-shadow: none;
@@ -96,6 +98,18 @@ class CineApplication(Adw.Application):
     window.csd:backdrop {
       box-shadow: none;
     }
+
+    popover > contents {
+      box-shadow: none;
+      border-radius: 8px;
+    }
+
+    /* The list under a dropdown is set 6px off its button by padding on
+       the popover node itself, which is transparent - so black here. */
+    dropdown popover.menu,
+    combobox popover.menu {
+      padding-top: 0;
+    }
     """
 
     def do_startup(self):
@@ -106,6 +120,7 @@ class CineApplication(Adw.Application):
         trace("Adw startup done")
 
         if IS_WINDOWS:
+            round_new_windows()
             provider = Gtk.CssProvider()
             provider.load_from_data(self.WINDOWS_CSS)
             Gtk.StyleContext.add_provider_for_display(

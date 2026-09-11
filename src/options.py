@@ -25,12 +25,6 @@ from typing import cast
 import gi
 
 from . import video2x
-from .anime4k import (
-    MODE_INDEX_MAP,
-    MODE_TO_INDEX,
-    apply_anime4k_shaders,
-    get_current_mode,
-)
 
 gi.require_version("Gtk", "4.0")
 from gi.repository import Gtk
@@ -79,8 +73,8 @@ class OptionsMenuButton(Gtk.MenuButton):
     crop_dropdown: Gtk.DropDown = Gtk.Template.Child()
     crop_list: Gtk.StringList = Gtk.Template.Child()
     upscale_dropdown: Gtk.DropDown = Gtk.Template.Child()
-    video2x_mode_dropdown: Gtk.DropDown = Gtk.Template.Child()
-    video2x_render_dropdown: Gtk.DropDown = Gtk.Template.Child()
+    interp_dropdown: Gtk.DropDown = Gtk.Template.Child()
+    render_timing_dropdown: Gtk.DropDown = Gtk.Template.Child()
     zoom_spin: Gtk.SpinButton = Gtk.Template.Child()
     contrast_spin: Gtk.SpinButton = Gtk.Template.Child()
     brightness_spin: Gtk.SpinButton = Gtk.Template.Child()
@@ -219,18 +213,14 @@ class OptionsMenuButton(Gtk.MenuButton):
             self.crop_dropdown.set_selected(0)
             self.crop_reset_btn.set_sensitive(False)
 
-        current_mode = get_current_mode(self._win.mpv)
-        upscale_idx = MODE_TO_INDEX.get(current_mode, 0)
-        if self.upscale_dropdown.get_selected() != upscale_idx:
-            self.upscale_dropdown.set_selected(upscale_idx)
-
         v2x = self._win.video2x
-        mode_idx = video2x.MODE_TO_INDEX.get(v2x.mode, 0)
-        if self.video2x_mode_dropdown.get_selected() != mode_idx:
-            self.video2x_mode_dropdown.set_selected(mode_idx)
-        render_idx = video2x.RENDER_TO_INDEX.get(v2x.render, 0)
-        if self.video2x_render_dropdown.get_selected() != render_idx:
-            self.video2x_render_dropdown.set_selected(render_idx)
+        for dropdown, index in (
+            (self.upscale_dropdown, video2x.UPSCALE_TO_INDEX.get(v2x.upscale, 0)),
+            (self.interp_dropdown, video2x.INTERP_TO_INDEX.get(v2x.interp, 0)),
+            (self.render_timing_dropdown, video2x.RENDER_TO_INDEX.get(v2x.render, 0)),
+        ):
+            if dropdown.get_selected() != index:
+                dropdown.set_selected(index)
 
     @Gtk.Template.Callback()
     def _on_reset_all_options(self, _btn):
@@ -239,7 +229,7 @@ class OptionsMenuButton(Gtk.MenuButton):
         self._on_rotate_reset(None)
         self._on_flip_reset(None)
         self.upscale_dropdown.set_selected(0)
-        self.video2x_mode_dropdown.set_selected(0)
+        self.interp_dropdown.set_selected(0)
         self.zoom_spin.set_value(0)
         self.contrast_spin.set_value(0)
         self.brightness_spin.set_value(0)
@@ -449,26 +439,39 @@ class OptionsMenuButton(Gtk.MenuButton):
         self.speed_spin.set_value(1.0)
         self.speed_reset_btn.set_sensitive(False)
 
-    # --- UPSCALE (ANIME4K) ---
+    # --- UPSCALE (VIDEO2X) ---
     @Gtk.Template.Callback()
     def _on_upscale_changed(self, dropdown, *arg):
         idx = dropdown.get_selected()
-        mode = MODE_INDEX_MAP[idx] if idx < len(MODE_INDEX_MAP) else "off"
-        apply_anime4k_shaders(self._win.mpv, mode)
+        value = (
+            video2x.UPSCALE_INDEX_MAP[idx]
+            if idx < len(video2x.UPSCALE_INDEX_MAP)
+            else video2x.UPSCALE_OFF
+        )
+        self._win.video2x.set_upscale(value)
 
     @Gtk.Template.Callback()
     def _on_upscale_reset(self, _btn):
         self.upscale_dropdown.set_selected(0)
 
-    # --- AI RENDER (VIDEO2X) ---
+    # --- FRAME INTERPOLATION (VIDEO2X) ---
     @Gtk.Template.Callback()
-    def _on_video2x_mode_changed(self, dropdown, *arg):
+    def _on_interp_changed(self, dropdown, *arg):
         idx = dropdown.get_selected()
-        mode = video2x.MODE_INDEX_MAP[idx] if idx < len(video2x.MODE_INDEX_MAP) else "off"
-        self._win.video2x.set_mode(mode)
+        value = (
+            video2x.INTERP_INDEX_MAP[idx]
+            if idx < len(video2x.INTERP_INDEX_MAP)
+            else video2x.INTERP_OFF
+        )
+        self._win.video2x.set_interp(value)
 
     @Gtk.Template.Callback()
-    def _on_video2x_render_changed(self, dropdown, *arg):
+    def _on_interp_reset(self, _btn):
+        self.interp_dropdown.set_selected(0)
+
+    # --- AI RENDER TIMING (VIDEO2X) ---
+    @Gtk.Template.Callback()
+    def _on_render_timing_changed(self, dropdown, *arg):
         idx = dropdown.get_selected()
         render = (
             video2x.RENDER_INDEX_MAP[idx]
@@ -478,5 +481,5 @@ class OptionsMenuButton(Gtk.MenuButton):
         self._win.video2x.set_render(render)
 
     @Gtk.Template.Callback()
-    def _on_video2x_reset(self, _btn):
-        self.video2x_mode_dropdown.set_selected(0)
+    def _on_render_timing_reset(self, _btn):
+        self.render_timing_dropdown.set_selected(0)

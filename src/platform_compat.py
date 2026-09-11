@@ -33,6 +33,9 @@ logger = logging.getLogger(__name__)
 
 IS_WINDOWS = os.name == "nt"
 
+# Set NEKOPLAY_TRACE=1 for a timestamped startup trace; see the end of this file.
+TRACE = bool(os.environ.get("NEKOPLAY_TRACE"))
+
 # mpv separates path lists with ':' on Unix and ';' on Windows, because a
 # colon is part of every absolute path here.
 MPV_PATH_SEP = ";" if IS_WINDOWS else ":"
@@ -256,30 +259,152 @@ if IS_WINDOWS:
             ptr = ctypes.pythonapi.PyCapsule_GetPointer(surface.__gpointer__, None)
 
             hwnd = gtk.gdk_win32_surface_get_handle(ptr)
-            if not hwnd:
-                return
-
-            dwm = ctypes.WinDLL("dwmapi.dll")
-            for attribute, value in (
-                (_DWMWA_WINDOW_CORNER_PREFERENCE, _DWMWCP_ROUND),
-                (_DWMWA_BORDER_COLOR, _DWMWA_COLOR_NONE),
-            ):
-                setting = ctypes.c_uint(value)
-                dwm.DwmSetWindowAttribute(
-                    ctypes.c_void_p(hwnd),
-                    attribute,
-                    ctypes.byref(setting),
-                    ctypes.sizeof(setting),
-                )
+            if hwnd:
+                _round_hwnd(hwnd)
         except Exception:
+            logger.exception("round_window_corners failed")
+
+    def _round_hwnd(hwnd: int) -> bool:
+        """Rounded corners and no DWM border for one native window."""
+        dwm = ctypes.WinDLL("dwmapi.dll")
+        dwm.DwmSetWindowAttribute.argtypes = [
+            ctypes.c_void_p, ctypes.c_uint, ctypes.c_void_p, ctypes.c_uint,
+        ]
+        ok = True
+        for attribute, value in (
+            (_DWMWA_WINDOW_CORNER_PREFERENCE, _DWMWCP_ROUND),
+            (_DWMWA_BORDER_COLOR, _DWMWA_COLOR_NONE),
+        ):
+            setting = ctypes.c_uint(value)
             # Rounded corners only exist from Windows 11 on; older versions
             # return an error and simply keep square ones.
-            logger.exception("round_window_corners failed")
+            if dwm.DwmSetWindowAttribute(
+                hwnd, attribute, ctypes.byref(setting), ctypes.sizeof(setting)
+            ) != 0:
+                ok = False
+        return ok
+
+    # Popovers, menus, dropdown lists and tooltips are native windows of
+    # their own, created by GTK whenever one opens, and each has the same
+    # problem as the toplevel: GTK expects an alpha channel and draws rounded
+    # corners over what it assumes is transparency, and on Windows that is
+    # black. There is no GTK signal for "a surface was created", but Windows
+    # has one for "a window was shown", and only for that event: a WinEvent
+    # hook on EVENT_OBJECT_SHOW. It is also the right moment - DWM rejects
+    # the attribute while a window is still being created (a CBT hook at
+    # HCBT_CREATEWND is too early) and accepts it once shown. Out-of-context,
+    # because the in-context kind needs the callback in a DLL; this one is
+    # delivered through our own message loop a moment after the show.
+
+    _EVENT_OBJECT_DESTROY = 0x8001
+    _EVENT_OBJECT_SHOW = 0x8002
+    _OBJID_WINDOW = 0
+    _WINEVENT_OUTOFCONTEXT = 0x0000
+    _GWL_STYLE = -16
+    _WS_CHILD = 0x40000000
+
+    _WINEVENTPROC = ctypes.WINFUNCTYPE(
+        None,
+        ctypes.c_void_p,  # HWINEVENTHOOK
+        ctypes.c_uint,  # event
+        ctypes.c_void_p,  # hwnd
+        ctypes.c_long,  # idObject
+        ctypes.c_long,  # idChild
+        ctypes.c_uint,  # idEventThread
+        ctypes.c_uint,  # dwmsEventTime
+    )
+    _winevent_hook = None
+    _winevent_proc = None  # the callback must outlive the hook
+    _rounded: set[int] = set()
+
+    def round_new_windows() -> None:
+        """Round the corners of every window this thread shows from now on.
+
+        Call once, from the GUI thread, before any popover can open. The
+        toplevel is handled by round_window_corners on realize as well,
+        which is harmless; this exists for the windows GTK creates on its
+        own and never hands to the app.
+        """
+        global _winevent_hook, _winevent_proc
+        if _winevent_hook is not None:
+            return
+
+        user32 = ctypes.WinDLL("user32", use_last_error=True)
+        kernel32 = ctypes.WinDLL("kernel32")
+        user32.SetWinEventHook.restype = ctypes.c_void_p
+        user32.SetWinEventHook.argtypes = [
+            ctypes.c_uint, ctypes.c_uint, ctypes.c_void_p, _WINEVENTPROC,
+            ctypes.c_uint, ctypes.c_uint, ctypes.c_uint,
+        ]
+        user32.GetWindowLongW.restype = ctypes.c_long
+        user32.GetWindowLongW.argtypes = [ctypes.c_void_p, ctypes.c_int]
+
+        def proc(_hook, event, hwnd, id_object, id_child, _thread, _time):
+            if not hwnd or id_object != _OBJID_WINDOW or id_child != 0:
+                return
+            try:
+                if event == _EVENT_OBJECT_DESTROY:
+                    _rounded.discard(hwnd)
+                elif event == _EVENT_OBJECT_SHOW and hwnd not in _rounded:
+                    # Child windows have no frame of their own to round.
+                    if not user32.GetWindowLongW(hwnd, _GWL_STYLE) & _WS_CHILD:
+                        if _round_hwnd(hwnd):
+                            _rounded.add(hwnd)
+            except Exception:
+                logger.exception("Could not round a new window")
+
+        _winevent_proc = _WINEVENTPROC(proc)
+        _winevent_hook = user32.SetWinEventHook(
+            _EVENT_OBJECT_DESTROY,
+            _EVENT_OBJECT_SHOW,
+            None,
+            _winevent_proc,
+            kernel32.GetCurrentProcessId(),
+            kernel32.GetCurrentThreadId(),
+            _WINEVENT_OUTOFCONTEXT,
+        )
+        if not _winevent_hook:
+            logger.warning("SetWinEventHook failed (%d)", ctypes.get_last_error())
+
+    def strip_popover_arrows(root) -> None:
+        """Take the arrow off every popover under *root*.
+
+        A popover with an arrow gets a surface tall enough for the tail, and
+        the strip beside the tail is transparent in GTK's eyes - black here.
+        The tail's size is a constant in GtkPopover, not CSS, so the only way
+        to lose the strip is to lose the arrow. Menu buttons create their
+        popovers up front, so a walk over the tree finds them all.
+        """
+        import gi
+
+        gi.require_version("Gtk", "4.0")
+        from gi.repository import Gtk
+
+        stack = [root]
+        while stack:
+            widget = stack.pop()
+            popover = None
+            if isinstance(widget, Gtk.MenuButton):
+                popover = widget.get_popover()
+            elif isinstance(widget, Gtk.Popover):
+                popover = widget
+            if popover is not None:
+                popover.set_has_arrow(False)
+            child = widget.get_first_child()
+            while child is not None:
+                stack.append(child)
+                child = child.get_next_sibling()
 
 else:
 
     def round_window_corners(window) -> None:
         """The window manager handles this everywhere else."""
+
+    def round_new_windows() -> None:
+        """The window manager handles this everywhere else."""
+
+    def strip_popover_arrows(root) -> None:
+        """Popovers are transparent everywhere else."""
 
 
 # --- Idle inhibition -------------------------------------------------------
@@ -336,7 +461,6 @@ else:
 # so the numbers include loading the interpreter and the ~200 DLLs behind
 # GTK - which is where most of a cold launch actually goes.
 
-TRACE = bool(os.environ.get("NEKOPLAY_TRACE"))
 
 
 def _process_start_time() -> float:

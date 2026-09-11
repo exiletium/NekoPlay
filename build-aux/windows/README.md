@@ -32,7 +32,7 @@ Then, from the top of the source tree:
 
 ```bash
 ./build-aux/windows/build.sh                    # meson configure/compile/install
-./build-aux/windows/bundle.sh --with-anime4k    # collect into dist/NekoPlay
+./build-aux/windows/bundle.sh                   # collect into dist/NekoPlay
 ./build-aux/windows/installer.sh                # wrap it in NekoPlay-<ver>-Setup.exe
 ```
 
@@ -42,14 +42,11 @@ The installer step additionally needs `mingw-w64-ucrt-x86_64-nsis`.
 MSYS2 installed, and can be zipped, moved or renamed freely. `nekoplay.exe`
 works out where it lives at startup and everything else follows from that.
 
-Drop `--with-anime4k` to skip fetching the shaders; the build then needs no
-network. The archive is pinned to the same release and SHA256 as the Flatpak
-manifest.
-
 `--with-video2x=DIR` copies a video2x_optimized portable bundle (the folder
 holding `video2x.bat`) into the app, so AI upscaling works with no setup. It
-adds ~270 MB; without it the feature works from a folder the user picks in
-Preferences. See "AI upscaling and interpolation" below.
+adds ~330 MB; without it the feature works from a folder the user picks in
+Preferences. See "AI upscaling and interpolation" below. Upstream's Anime4K
+shader presets are not in this port: the upscale row is video2x's.
 
 ## The installer
 
@@ -150,10 +147,41 @@ exists. To see which renderer you got:
 GSK_DEBUG=renderer nekoplay.exe
 ```
 
+## Black frames, and where the rounded corners come from
+
+GTK draws client-side decorations and popovers on the assumption that the
+surface has an alpha channel: it reserves a margin for the drop shadow and
+rounds the corners, and expects everything outside to be transparent. On
+Win32 nothing outside the painted area is transparent - it is black. So the
+toplevel sat in a thick black frame, and every popover, menu and dropdown
+list had one of its own (the list under a dropdown even carries a 6 px
+`padding-top` on the transparent popover node).
+
+The CSS in `main.py` removes the shadows and that padding, so every surface
+is exactly its content. The rounded corners come back from DWM instead:
+`DWMWA_WINDOW_CORNER_PREFERENCE = DWMWCP_ROUND` (8 px, the only large
+radius it offers; the popover CSS radius is set to match), with
+`DWMWA_BORDER_COLOR = DWMWA_COLOR_NONE` so DWM does not add a hairline of
+its own. The toplevel gets this on realize. Popovers are windows GTK creates
+and never hands to the app, so `platform_compat.round_new_windows` sets an
+out-of-process WinEvent hook on `EVENT_OBJECT_SHOW` for this thread and
+applies the attributes to every window as it is shown - shown, not created:
+DWM rejects the attribute during creation (a CBT hook at `HCBT_CREATEWND`
+was tried first and is too early).
+
+Popover arrows are turned off on Windows (`strip_popover_arrows`): the tail
+sits in a strip GTK leaves transparent, its height is a constant in
+GtkPopover rather than CSS, and the strip would be black.
+
 ## AI upscaling and interpolation (video2x)
 
-Preferences and the in-player options panel carry an **AI Render** setting:
-Off, Upscale ×4 (Real-ESRGAN), Interpolate 2× or 4× (RIFE v4.26). It runs
+Preferences and the in-player options panel carry two settings backed by
+video2x_optimized: **Upscale (video2x)** - Off or ×4 (Real-ESRGAN) - and
+**Frame Interpolation** - Off, 2× or 4× (RIFE v4.26). Both on means two
+passes, interpolation first: RIFE's cost is in full-resolution warps, so
+interpolating the upscaled frames would cost sixteen times as much while
+upscaling twice the frames costs twice. The intermediate lives in the cache
+beside the final file and is removed when the chain finishes. It runs
 video2x_optimized, the GPU-resident ONNX Runtime pipeline, as a subprocess;
 it is never imported into the app, because it needs its own Python with
 onnxruntime-directml. The app looks for it in `share/cine/video2x`
@@ -173,7 +201,10 @@ Two timings, in Preferences under **AI Render Timing**:
 - **Pre-render** keeps the load deferred until the whole file is rendered,
   with a progress toast that can cancel; cancelling plays the original.
   Full quality and full seeking.
-- **Live** opens the output once ~4 s of it exist and plays it as it grows.
+- **Live** opens the output once ~4 s of it exist past where playback will
+  start - a resume, or the file re-opened after a setting changed, does not
+  begin at zero - and plays it as it grows. In a chain that wait includes
+  every pass before the last, since only the last writes the file played.
   When the render is slower than playback the player pauses with
   "Rendering ahead…" on the OSD and continues once the render is 4 s ahead
   again, like buffering a stream. Seeking beyond what has been rendered
@@ -194,7 +225,10 @@ the renders not watched for longest are deleted until it fits. Half-written
 leftovers go first, and a render still being written or played is skipped. Engines are per-resolution ONNX files: a missing
 one is built on the spot if the install's Python has PyTorch (seconds for
 the upscaler, a minute or two for RIFE); otherwise the original plays and a
-toast says why. Videos with rotation metadata are played unrendered, because
+toast says why. Recent video2x_optimized builds a missing engine itself, in
+under a second and without PyTorch, by re-targeting one it has
+(`video2x_opt.onnx_respec`); `Install.can_autobuild` detects that and skips
+the pre-build. Videos with rotation metadata are played unrendered, because
 the pipeline's decoder would autorotate them into the wrong shape. A render
 left running when the window closes is killed with everything it spawned -
 a Windows Job Object flagged kill-on-close, so this holds even if the app

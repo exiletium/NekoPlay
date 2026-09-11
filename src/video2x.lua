@@ -57,6 +57,10 @@ mp.add_hook("on_load", 50, function(hook)
     local id = tostring(next_id)
     pending[id] = hook
     hook:defer()
+    -- Where playback will begin: a resume, or the app re-opening the file
+    -- after a setting changed. A live render has to reach that point,
+    -- not just the start of the file, before it is worth opening.
     mp.commandv("script-message", "video2x-want", id,
-                mp.get_property("stream-open-filename"))
+                mp.get_property("stream-open-filename"),
+                mp.get_property("start", "none"))
 end)

@@ -99,33 +99,27 @@ template $Preferences: Adw.Dialog {
 					subtitle: _("Use GPU for video decoding when available");
 				}
 
-				Adw.ComboRow anime4k_mode_row {
-					title: _("Default Upscale Mode (Anime4K)");
-					subtitle: _("Applied automatically when a video is loaded");
+				Adw.ComboRow video2x_upscale_row {
+					title: _("Default Upscale (video2x)");
+					subtitle: _("Upscale videos with Real-ESRGAN through video2x_optimized when they open");
 
 					model: Gtk.StringList {
 						strings [
 							_("Off"),
-							// TRANSLATORS: Anime4K preset optimized for 1080p anime
-							_("1080p Anime"),
-							// TRANSLATORS: Anime4K preset optimized for 720p anime
-							_("720p Anime"),
-							// TRANSLATORS: Anime4K preset optimized for 480p anime
-							_("480p Anime"),
+							_("×4"),
 						]
 					};
 				}
 
-				Adw.ComboRow video2x_mode_row {
-					title: _("Default AI Render (video2x)");
-					subtitle: _("Upscale or interpolate videos with video2x_optimized when they open");
+				Adw.ComboRow video2x_interp_row {
+					title: _("Default Frame Interpolation");
+					subtitle: _("Multiply the frame rate with RIFE through video2x_optimized when videos open");
 
 					model: Gtk.StringList {
 						strings [
 							_("Off"),
-							_("Upscale ×4"),
-							_("Interpolate 2×"),
-							_("Interpolate 4×"),
+							_("2×"),
+							_("4×"),
 						]
 					};
 				}

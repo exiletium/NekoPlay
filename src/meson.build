@@ -83,7 +83,6 @@ cine_sources = [
   'shaders/flip-h.glsl',
   'shaders/flip-v.glsl',
   '__init__.py',
-  'anime4k.py',
   'history.py',
   'main.py',
   'mpv_gl_area.py',

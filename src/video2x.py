@@ -39,8 +39,10 @@ Two ways to wait for the render:
   waits for it, the way it would buffer a stream. Seeking ahead of what has
   been rendered waits too, because the render is sequential.
 
-Rendered files are cached under the config directory, keyed by the source
-file and the mode, so a file is rendered once. Engines are per-resolution.
+Two settings, upscaling and frame interpolation, combine into a recipe of
+one or two passes (interpolation first; see Recipe). Rendered files are
+cached under the config directory, keyed by the source file and the recipe,
+so a file is rendered once. Engines are per-resolution.
 A missing one is built on the spot: recent video2x_optimized re-targets an
 engine it already has, inside the render command, in a fraction of a second
 and without PyTorch. Older installs fall back to a real export from the
@@ -78,28 +80,94 @@ if TRACE:
     # trace is the natural place to ask for them.
     logger.setLevel(logging.INFO)
 
-# --- Modes -----------------------------------------------------------------
+# --- Settings and recipes ---------------------------------------------------
+#
+# Two independent settings, upscaling and frame interpolation, each with its
+# own row in the options panel and in Preferences. Their orders match the
+# dropdowns in options.blp and preferences.blp.
 
-MODE_OFF = "off"
-MODE_UPSCALE = "upscale"
-MODE_INTERP2 = "interp2"
-MODE_INTERP4 = "interp4"
+UPSCALE_OFF = "off"
+UPSCALE_X4 = "x4"
+UPSCALE_INDEX_MAP: list[str] = [UPSCALE_OFF, UPSCALE_X4]
+UPSCALE_TO_INDEX: dict[str, int] = {v: i for i, v in enumerate(UPSCALE_INDEX_MAP)}
+UPSCALE_FACTOR = {UPSCALE_OFF: 1, UPSCALE_X4: 4}
 
-# Order matches the dropdowns in options.blp and preferences.blp.
-MODE_INDEX_MAP: list[str] = [MODE_OFF, MODE_UPSCALE, MODE_INTERP2, MODE_INTERP4]
-MODE_TO_INDEX: dict[str, int] = {m: i for i, m in enumerate(MODE_INDEX_MAP)}
+INTERP_OFF = "off"
+INTERP_2X = "2x"
+INTERP_4X = "4x"
+INTERP_INDEX_MAP: list[str] = [INTERP_OFF, INTERP_2X, INTERP_4X]
+INTERP_TO_INDEX: dict[str, int] = {v: i for i, v in enumerate(INTERP_INDEX_MAP)}
+INTERP_FACTOR = {INTERP_OFF: 1, INTERP_2X: 2, INTERP_4X: 4}
 
 RENDER_PRE = "pre"
 RENDER_LIVE = "live"
 RENDER_INDEX_MAP: list[str] = [RENDER_PRE, RENDER_LIVE]
 RENDER_TO_INDEX: dict[str, int] = {r: i for i, r in enumerate(RENDER_INDEX_MAP)}
 
-MODE_LABELS = {
-    MODE_OFF: _("Off"),
-    MODE_UPSCALE: _("Upscale ×4"),
-    MODE_INTERP2: _("Interpolate 2×"),
-    MODE_INTERP4: _("Interpolate 4×"),
-}
+STAGE_INTERP = "interp"
+STAGE_UPSCALE = "upscale"
+
+
+@dataclass(frozen=True)
+class Stage:
+    """One pass of video2x: interpolate by a factor, or upscale by one."""
+
+    kind: str
+    factor: int
+
+    @property
+    def label(self) -> str:
+        if self.kind == STAGE_INTERP:
+            return _("Interpolate %d×") % self.factor
+        return _("Upscale ×%d") % self.factor
+
+    def out_fps(self, fps: float) -> float:
+        return fps * self.factor if self.kind == STAGE_INTERP else fps
+
+    def out_frames(self, frames: int) -> int:
+        if self.kind == STAGE_INTERP:
+            return max(0, (frames - 1) * self.factor + 1)
+        return frames
+
+
+@dataclass(frozen=True)
+class Recipe:
+    """What to do to a file: the two settings combined.
+
+    video2x does one thing per run, so both on means two passes. They go
+    interpolation first: RIFE's cost is in full-resolution warps, so
+    interpolating the upscaled frames would cost sixteen times as much,
+    while upscaling twice the frames only costs twice.
+    """
+
+    interp: int = 1
+    upscale: int = 1
+
+    @property
+    def active(self) -> bool:
+        return self.interp > 1 or self.upscale > 1
+
+    @property
+    def key(self) -> str:
+        parts = []
+        if self.interp > 1:
+            parts.append(f"interp{self.interp}")
+        if self.upscale > 1:
+            parts.append(f"up{self.upscale}")
+        return "+".join(parts) or "off"
+
+    @property
+    def stages(self) -> list[Stage]:
+        out = []
+        if self.interp > 1:
+            out.append(Stage(STAGE_INTERP, self.interp))
+        if self.upscale > 1:
+            out.append(Stage(STAGE_UPSCALE, self.upscale))
+        return out
+
+    @property
+    def label(self) -> str:
+        return " → ".join(stage.label for stage in self.stages) or _("Off")
 
 # Live playback opens the file once this much of it exists, and pauses to
 # let the render get this far ahead again whenever it catches up.
@@ -174,25 +242,25 @@ class Install:
             )
         return self._can_autobuild
 
-    def engine_path(self, mode: str, width: int, height: int) -> str:
-        if mode == MODE_UPSCALE:
+    def engine_path(self, stage: Stage, width: int, height: int) -> str:
+        if stage.kind == STAGE_UPSCALE:
             stem = os.path.splitext(SR_WEIGHTS)[0]
             return os.path.join(self.models_dir, f"{stem}_{width}x{height}_u8.onnx")
         return os.path.join(self.models_dir, f"rife_v4.26_{width}x{height}_u8_fast.onnx")
 
-    def has_engine(self, mode: str, width: int, height: int) -> bool:
-        if os.path.isfile(self.engine_path(mode, width, height)):
+    def has_engine(self, stage: Stage, width: int, height: int) -> bool:
+        if os.path.isfile(self.engine_path(stage, width, height)):
             return True
-        if mode != MODE_UPSCALE:
+        if stage.kind != STAGE_UPSCALE:
             # The CLI falls back to the reference engine when there is no
             # fast one for a resolution.
             reference = os.path.join(self.models_dir, f"rife_v4.26_{width}x{height}_u8.onnx")
             return os.path.isfile(reference)
         return False
 
-    def export_command(self, mode: str, width: int, height: int) -> list[str]:
+    def export_command(self, stage: Stage, width: int, height: int) -> list[str]:
         assert self.python
-        if mode == MODE_UPSCALE:
+        if stage.kind == STAGE_UPSCALE:
             return [
                 self.python,
                 "-m",
@@ -222,18 +290,16 @@ class Install:
             "--warp-mode",
             "all",
             "--out",
-            os.path.relpath(self.engine_path(mode, width, height), self.root),
+            os.path.relpath(self.engine_path(stage, width, height), self.root),
         ]
 
-    def render_command(
-        self, mode: str, src: str, dst: str, stream: bool
-    ) -> list[str]:
+    def render_command(self, stage: Stage, src: str, dst: str, stream: bool) -> list[str]:
         assert self.python
         cmd = [self.python, "-m", "video2x_opt", "-i", src, "-o", dst]
-        if mode == MODE_UPSCALE:
+        if stage.kind == STAGE_UPSCALE:
             cmd.append("--upscale")
         else:
-            cmd += ["-m", "4" if mode == MODE_INTERP4 else "2"]
+            cmd += ["-m", str(stage.factor)]
         if stream:
             cmd.append("--stream")
         return cmd
@@ -444,6 +510,27 @@ class Source:
     rotation: int
 
 
+def parse_start(value: str) -> float:
+    """Seconds from mpv's ``start`` option, or 0 for anything else.
+
+    Handles the forms mpv writes itself - plain seconds, ``+seconds`` and
+    ``hh:mm:ss.ms`` - and gives up on chapters, percentages and negative
+    (from-the-end) offsets, which nothing here produces.
+    """
+    value = (value or "").strip()
+    if not value or value == "none" or value.startswith(("-", "#")) or value.endswith("%"):
+        return 0.0
+    value = value.lstrip("+")
+    try:
+        parts = [float(x) for x in value.split(":")]
+    except ValueError:
+        return 0.0
+    seconds = 0.0
+    for part in parts:
+        seconds = seconds * 60 + part
+    return max(0.0, seconds)
+
+
 def probe_source(path: str, ffmpeg_dir: str | None) -> Source | None:
     ffprobe = shutil.which(
         "ffprobe", path=ffmpeg_dir or os.environ.get("PATH")
@@ -514,10 +601,15 @@ def probe_source(path: str, ffmpeg_dir: str | None) -> Source | None:
 # --- The cache -------------------------------------------------------------
 
 
-def cache_key(source: Source, mode: str) -> str:
+def cache_key(source: Source, recipe: Recipe) -> str:
     stat = os.stat(source.path)
-    raw = f"{os.path.abspath(source.path)}|{stat.st_size}|{int(stat.st_mtime)}|{mode}"
+    raw = f"{os.path.abspath(source.path)}|{stat.st_size}|{int(stat.st_mtime)}|{recipe.key}"
     return hashlib.sha1(raw.encode("utf-8", "surrogateescape")).hexdigest()[:20]
+
+
+def stage_path(key: str, index: int) -> str:
+    """Where a chain parks the output of a pass that is not the last."""
+    return os.path.join(CACHE_DIR, f"{key}.stage{index}.mkv")
 
 
 def cache_paths(key: str) -> tuple[str, str]:
@@ -590,6 +682,8 @@ def trim_cache(limit_bytes: int, keep: set[str] = frozenset()) -> int:
         key, ext = os.path.splitext(name)
         if ext not in (".mkv", ".done"):
             continue
+        # <key>.stage1.mkv belongs to <key>.
+        key = key.split(".", 1)[0]
         try:
             st = os.stat(os.path.join(CACHE_DIR, name))
         except OSError:
@@ -605,7 +699,10 @@ def trim_cache(limit_bytes: int, keep: set[str] = frozenset()) -> int:
 
     def remove(key: str) -> int:
         got = 0
-        for path in cache_paths(key):
+        paths = list(cache_paths(key)) + [
+            os.path.join(CACHE_DIR, n) for n in names if n.startswith(key + ".stage")
+        ]
+        for path in paths:
             try:
                 size = os.path.getsize(path)
                 os.remove(path)
@@ -645,6 +742,8 @@ def trim_cache(limit_bytes: int, keep: set[str] = frozenset()) -> int:
 @dataclass
 class Progress:
     phase: str = "starting"  # starting | engine | render | done | failed | cancelled
+    stage: int = 0  # index into the recipe's stages
+    stages: int = 1
     frames_done: int = 0
     frames_total: int = 0
     out_fps: float = 0.0
@@ -652,10 +751,15 @@ class Progress:
     error: str = ""
 
     @property
-    def fraction(self) -> float:
+    def stage_fraction(self) -> float:
         if not self.frames_total:
             return 0.0
         return min(1.0, self.frames_done / self.frames_total)
+
+    @property
+    def fraction(self) -> float:
+        """Across the whole recipe, each pass weighted equally."""
+        return (self.stage + self.stage_fraction) / max(1, self.stages)
 
 
 class RenderJob(threading.Thread):
@@ -665,24 +769,24 @@ class RenderJob(threading.Thread):
     ``cond`` is notified on every change, so a waiter can sleep on it.
     """
 
-    def __init__(self, install: Install, source: Source, mode: str, stream: bool):
+    def __init__(self, install: Install, source: Source, recipe: Recipe, stream: bool):
         super().__init__(name="video2x-render", daemon=True)
         self.install = install
         self.source = source
-        self.mode = mode
+        self.recipe = recipe
+        self.stages = recipe.stages
         self.stream = stream
-        self.key = cache_key(source, mode)
+        self.key = cache_key(source, recipe)
         self.output, self.marker = cache_paths(self.key)
-        self.progress = Progress()
+        self.progress = Progress(stages=len(self.stages))
         self.cond = threading.Condition()
         self._tree: ProcessTree | None = None
         self._cancelled = False
         self.on_done = None  # called on this thread once the job is over
 
-        multiplier = {MODE_INTERP2: 2, MODE_INTERP4: 4}.get(mode, 1)
-        # What the output's frame rate will be, to turn a frame count into
-        # seconds for the live follower.
-        self.out_fps = source.fps * multiplier
+        # The final output's frame rate, to turn a frame count into seconds
+        # for the live follower.
+        self.out_fps = source.fps * recipe.interp
 
     # -- state --------------------------------------------------------------
 
@@ -695,11 +799,23 @@ class RenderJob(threading.Thread):
         return self.progress.phase == "done"
 
     def rendered_seconds(self) -> float:
-        """How far into the file the encoder has got."""
+        """How far into the file the final output has got.
+
+        Zero while an earlier pass of a chain is still running: nothing of
+        the file that will be played exists yet.
+        """
         if not self.out_fps:
             return 0.0
         with self.cond:
+            if self.progress.stage != len(self.stages) - 1:
+                return 0.0
             return self.progress.frames_done / self.out_fps
+
+    @property
+    def streaming(self) -> bool:
+        """Whether the pass now running is the one the player will read."""
+        with self.cond:
+            return self.progress.phase == "render" and self.progress.stage == len(self.stages) - 1
 
     def _set(self, **changes) -> None:
         with self.cond:
@@ -746,27 +862,11 @@ class RenderJob(threading.Thread):
         os.makedirs(CACHE_DIR, exist_ok=True)
         src = self.source
 
-        if not self.install.has_engine(self.mode, src.width, src.height):
-            if self.install.can_autobuild:
-                # The render command builds it as it starts, in well under a
-                # second. Nothing to do here, and no phase worth showing.
-                logger.info(
-                    "no %s engine for %dx%d; video2x will build one",
-                    self.mode, src.width, src.height,
-                )
-            elif self.install.can_export:
-                self._set(phase="engine")
-                if not self._run_child(self.install.export_command(self.mode, src.width, src.height), None):
-                    return
-                if not self.install.has_engine(self.mode, src.width, src.height):
-                    self._set(phase="failed", error=_("Building the engine produced no file."))
-                    return
-            else:
-                self._set(
-                    phase="failed",
-                    error=_("No engine for %dx%d, and this video2x install cannot build one.")
-                    % (src.width, src.height),
-                )
+        # Every pass keeps the source's width and height (interpolation
+        # changes only the frame rate, and upscaling is last), so one engine
+        # check per kind of pass covers the chain.
+        for stage in self.stages:
+            if not self._ensure_engine(stage, src.width, src.height):
                 return
 
         # Anything left over from a run that did not finish.
@@ -776,35 +876,73 @@ class RenderJob(threading.Thread):
             except OSError:
                 pass
 
-        self._set(phase="render", frames_total=self._expected_frames())
-        if not self._run_child(
-            self.install.render_command(self.mode, src.path, self.output, self.stream),
-            self._on_progress_line,
-        ):
-            # Half a file is no use to anyone. It may still be open in the
-            # player after a live session, in which case the next render
-            # overwrites it instead.
+        last = len(self.stages) - 1
+        inputs = src.path
+        frames = src.nb_frames
+        intermediates = []
+        for index, stage in enumerate(self.stages):
+            is_last = index == last
+            output = self.output if is_last else stage_path(self.key, index)
+            if not is_last:
+                intermediates.append(output)
+            self._set(
+                phase="render",
+                stage=index,
+                frames_done=0,
+                frames_total=stage.out_frames(frames),
+                out_fps=0.0,
+            )
+            ok = self._run_child(
+                self.install.render_command(stage, inputs, output, self.stream and is_last),
+                self._on_progress_line,
+            )
+            if not ok or not os.path.isfile(output) or os.path.getsize(output) == 0:
+                # Half a file is no use to anyone. The final output may
+                # still be open in the player after a live session, in
+                # which case the next render overwrites it instead.
+                for path in intermediates + [self.output]:
+                    try:
+                        os.remove(path)
+                    except OSError:
+                        pass
+                if ok:
+                    self._set(phase="failed", error=_("The render produced no output."))
+                return
+            inputs = output
+            frames = stage.out_frames(frames)
+
+        for path in intermediates:
             try:
-                os.remove(self.output)
+                os.remove(path)
             except OSError:
                 pass
-            return
-
-        if not os.path.isfile(self.output) or os.path.getsize(self.output) == 0:
-            self._set(phase="failed", error=_("The render produced no output."))
-            return
 
         with open(self.marker, "w", encoding="utf-8") as marker:
-            json.dump({"source": src.path, "mode": self.mode}, marker)
+            json.dump({"source": src.path, "recipe": self.recipe.key}, marker)
         self._set(phase="done")
 
-    def _expected_frames(self) -> int:
-        n = self.source.nb_frames
-        if self.mode == MODE_INTERP2:
-            return max(0, (n - 1) * 2 + 1)
-        if self.mode == MODE_INTERP4:
-            return max(0, (n - 1) * 4 + 1)
-        return n
+    def _ensure_engine(self, stage: Stage, width: int, height: int) -> bool:
+        if self.install.has_engine(stage, width, height):
+            return True
+        if self.install.can_autobuild:
+            # The render command builds it as it starts, in well under a
+            # second. Nothing to do here, and no phase worth showing.
+            logger.info("no %s engine for %dx%d; video2x will build one", stage.kind, width, height)
+            return True
+        if self.install.can_export:
+            self._set(phase="engine")
+            if not self._run_child(self.install.export_command(stage, width, height), None):
+                return False
+            if not self.install.has_engine(stage, width, height):
+                self._set(phase="failed", error=_("Building the engine produced no file."))
+                return False
+            return True
+        self._set(
+            phase="failed",
+            error=_("No engine for %dx%d, and this video2x install cannot build one.")
+            % (width, height),
+        )
+        return False
 
     def _run_child(self, cmd: list[str], on_line) -> bool:
         logger.info("video2x: running %s", " ".join(cmd))
@@ -910,7 +1048,8 @@ class Video2X:
         self._load_script()
         self._publish_mode()
 
-        settings.connect("changed::video2x-mode", lambda *a: self._publish_mode())
+        settings.connect("changed::video2x-upscale", lambda *a: self._publish_mode())
+        settings.connect("changed::video2x-interp", lambda *a: self._publish_mode())
         settings.connect("changed::video2x-path", lambda *a: forget_install())
         settings.connect("changed::video2x-cache-limit", lambda *a: self._trim_later())
         # The limit may have been lowered, or a render left half-written,
@@ -924,8 +1063,9 @@ class Video2X:
                 for a in (event.as_dict().get("args") or [])
             ]
             if len(args) >= 3 and args[0] == "video2x-want":
+                start = parse_start(args[3]) if len(args) > 3 else 0.0
                 threading.Thread(
-                    target=self._decide, args=(args[1], args[2]),
+                    target=self._decide, args=(args[1], args[2], start),
                     name="video2x-decide", daemon=True,
                 ).start()
 
@@ -950,9 +1090,18 @@ class Video2X:
     # -- settings -----------------------------------------------------------
 
     @property
-    def mode(self) -> str:
-        mode = self._settings.get_string("video2x-mode")
-        return mode if mode in MODE_INDEX_MAP else MODE_OFF
+    def upscale(self) -> str:
+        value = self._settings.get_string("video2x-upscale")
+        return value if value in UPSCALE_INDEX_MAP else UPSCALE_OFF
+
+    @property
+    def interp(self) -> str:
+        value = self._settings.get_string("video2x-interp")
+        return value if value in INTERP_INDEX_MAP else INTERP_OFF
+
+    @property
+    def recipe(self) -> Recipe:
+        return Recipe(interp=INTERP_FACTOR[self.interp], upscale=UPSCALE_FACTOR[self.upscale])
 
     @property
     def render(self) -> str:
@@ -978,10 +1127,16 @@ class Video2X:
     def _trim_later(self) -> None:
         threading.Thread(target=self.trim_cache, name="video2x-trim", daemon=True).start()
 
-    def set_mode(self, mode: str) -> None:
-        if mode not in MODE_INDEX_MAP or mode == self.mode:
+    def set_upscale(self, value: str) -> None:
+        if value not in UPSCALE_INDEX_MAP or value == self.upscale:
             return
-        self._settings.set_string("video2x-mode", mode)
+        self._settings.set_string("video2x-upscale", value)
+        self._reopen_current()
+
+    def set_interp(self, value: str) -> None:
+        if value not in INTERP_INDEX_MAP or value == self.interp:
+            return
+        self._settings.set_string("video2x-interp", value)
         self._reopen_current()
 
     def set_render(self, render: str) -> None:
@@ -994,7 +1149,7 @@ class Video2X:
         # python-mpv's item access prefixes "options/", which user-data is
         # not under, so this goes through the set command instead.
         try:
-            self._mpv.command("set", "user-data/video2x/mode", self.mode)
+            self._mpv.command("set", "user-data/video2x/mode", self.recipe.key)
         except Exception:
             logger.exception("Could not publish the video2x mode to mpv")
 
@@ -1036,12 +1191,12 @@ class Video2X:
             # mpv is shutting down, or the load was abandoned; nothing to do.
             logger.debug("Could not answer video2x hook %s", request_id, exc_info=True)
 
-    def _decide(self, request_id: str, path: str) -> None:
+    def _decide(self, request_id: str, path: str, start: float = 0.0) -> None:
         """Worker thread: what should mpv open for *path*?"""
         target = ""
         started = time.monotonic()
         try:
-            target = self._decide_target(path) or ""
+            target = self._decide_target(path, start) or ""
         except Exception:
             logger.exception("video2x decision failed for %r", path)
         finally:
@@ -1051,9 +1206,9 @@ class Video2X:
             )
             self._answer(request_id, target)
 
-    def _decide_target(self, path: str) -> str | None:
-        mode = self.mode
-        if mode == MODE_OFF or not path or not os.path.isfile(path):
+    def _decide_target(self, path: str, start: float = 0.0) -> str | None:
+        recipe = self.recipe
+        if not recipe.active or not path or not os.path.isfile(path):
             return None
 
         install = locate(self._settings.get_string("video2x-path"))
@@ -1074,17 +1229,17 @@ class Video2X:
             )
             return None
 
-        key = cache_key(source, mode)
+        key = cache_key(source, recipe)
         output, marker = cache_paths(key)
         if os.path.isfile(marker) and os.path.isfile(output):
-            logger.info("video2x: cache hit for %s (%s)", os.path.basename(path), mode)
+            logger.info("video2x: cache hit for %s (%s)", os.path.basename(path), recipe.key)
             touch_cache_entry(key)
             return output
 
         # Make room before, and hold the line after: the new render counts
         # against the limit as soon as it is complete.
         self.trim_cache()
-        job = self._start_or_join(install, source, mode, key)
+        job = self._start_or_join(install, source, recipe, key)
         job.on_done = self.trim_cache
         idle_add_once(self._show_progress, job)
 
@@ -1092,11 +1247,13 @@ class Video2X:
             self._awaited.add(job)
         try:
             if self.render == RENDER_LIVE:
-                lead = min(LIVE_LEAD_SECONDS, max(1.0, source.duration * 0.25))
-                job.wait(
-                    lambda p: p.phase == "render"
-                    and p.frames_done / max(job.out_fps, 1e-9) >= lead
-                )
+                # In a chain this includes the whole of every pass before
+                # the last: only the last one writes the file to be played.
+                # Playback may not begin at zero - a resume, or the file
+                # re-opened after a setting changed - and the render does,
+                # so the lead is measured from where playback will start.
+                lead = start + min(LIVE_LEAD_SECONDS, max(1.0, source.duration * 0.25))
+                job.wait(lambda p: job.streaming and job.rendered_seconds() >= lead)
             else:
                 job.wait(lambda p: False)  # until it ends, one way or another
         finally:
@@ -1112,11 +1269,11 @@ class Video2X:
         idle_add_once(self._start_following, job)
         return output
 
-    def _start_or_join(self, install: Install, source: Source, mode: str, key: str) -> RenderJob:
+    def _start_or_join(self, install: Install, source: Source, recipe: Recipe, key: str) -> RenderJob:
         with self._jobs_lock:
             job = self._jobs.get(key)
             if job is None or job.finished:
-                job = RenderJob(install, source, mode, stream=self.render == RENDER_LIVE)
+                job = RenderJob(install, source, recipe, stream=self.render == RENDER_LIVE)
                 self._jobs[key] = job
                 job.start()
             return job
@@ -1177,20 +1334,28 @@ class Video2X:
     @staticmethod
     def _progress_text(job: RenderJob) -> str:
         p = job.progress
-        label = MODE_LABELS.get(job.mode, job.mode)
+        stage = job.stages[min(p.stage, len(job.stages) - 1)]
+        label = stage.label
+        if len(job.stages) > 1:
+            label = _("%s (%d/%d)") % (label, p.stage + 1, len(job.stages))
         if p.phase == "engine":
             return _("%s: building the engine for %d×%d…") % (
                 label, job.source.width, job.source.height,
             )
         if p.phase == "render" and p.frames_total:
             remaining = (p.frames_total - p.frames_done) / p.out_fps if p.out_fps else 0
-            speed = p.out_fps / job.out_fps if job.out_fps else 0
+            # Speed relative to this pass's own output rate. Its input runs
+            # at the source rate, or at the interpolated rate if a pass
+            # before it multiplied that.
+            in_fps = job.source.fps * (job.recipe.interp if p.stage > 0 else 1)
+            stage_fps = stage.out_fps(in_fps)
+            speed = p.out_fps / stage_fps if stage_fps else 0
             if remaining >= 3600:
                 eta = _("%d h %02d min") % divmod(int(remaining // 60), 60)
             else:
                 eta = _("%d:%02d") % divmod(int(remaining), 60)
             return _("%s: %d%% · %.2f× realtime · %s left") % (
-                label, int(p.fraction * 100), speed, eta,
+                label, int(p.stage_fraction * 100), speed, eta,
             )
         return _("%s: starting…") % label
 
