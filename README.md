@@ -25,7 +25,7 @@ NekoPlay is a fork of [Cine](https://github.com/diegopvlk/Cine) but with a few e
 >   ~150 ms, honouring the "Open New Window for New Files" preference.
 > - **AI upscaling and frame interpolation** through
 >   [video2x_optimized](https://github.com/exiletium/video2x_optimized)
->   (Real-ESRGAN and RIFE on DirectML), replacing Anime4K. Render the whole
+>   (Real-ESRGAN and RIFE on DirectML), replacing Anime4K.(Disclaimer: only works on AMD GPUS). Render the whole
 >   file first, or play it live while it renders — live renders fit
 >   themselves to the machine so they keep up, and seeking anywhere in one
 >   works. Quality, an output-height cap, a size-capped cache and
