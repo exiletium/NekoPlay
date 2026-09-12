@@ -111,6 +111,18 @@ RENDER_LIVE = "live"
 RENDER_INDEX_MAP: list[str] = [RENDER_PRE, RENDER_LIVE]
 RENDER_TO_INDEX: dict[str, int] = {r: i for i, r in enumerate(RENDER_INDEX_MAP)}
 
+QUALITY_SPEED = "speed"
+QUALITY_BALANCED = "balanced"
+QUALITY_QUALITY = "quality"
+QUALITY_INDEX_MAP: list[str] = [QUALITY_SPEED, QUALITY_BALANCED, QUALITY_QUALITY]
+QUALITY_TO_INDEX: dict[str, int] = {q: i for i, q in enumerate(QUALITY_INDEX_MAP)}
+
+# The heights the "Maximum Render Height" row offers, by row index. 0 is
+# "No limit"; the rest cap the upscaler's output (interpolation is never
+# capped - see RenderJob.frame_size).
+MAX_HEIGHT_INDEX_MAP: list[int] = [0, 1080, 1440, 2160, 2880]
+MAX_HEIGHT_TO_INDEX: dict[int, int] = {h: i for i, h in enumerate(MAX_HEIGHT_INDEX_MAP)}
+
 STAGE_INTERP = "interp"
 STAGE_UPSCALE = "upscale"
 
@@ -333,6 +345,12 @@ class Install:
         stream: bool,
         offset: float = 0.0,
         max_height: int = 0,
+        quality: str = QUALITY_BALANCED,
+        follow: bool = False,
+        expect_frames: int = 0,
+        no_audio: bool = False,
+        audio_from: str | None = None,
+        audio_start: float = 0.0,
     ) -> list[str]:
         """The command for one pass.
 
@@ -340,7 +358,13 @@ class Install:
         timestamps start at zero regardless. *max_height* has video2x decode
         the source smaller, so that this pass's output is at most that tall:
         for an upscale that is four times the decode height, for
-        interpolation the decode height itself.
+        interpolation the decode height itself. *quality* is the encoder
+        effort. For a live chain, the last pass reads the first pass's output
+        while it is still being written: *follow* makes the reader wait for
+        more instead of stopping at that file's current end, *expect_frames*
+        tells it when the input is really complete, and *audio_from* /
+        *audio_start* take the sound from the original file rather than the
+        partial intermediate.
         """
         assert self.python
         cmd = [self.python, "-m", "video2x_opt", "-i", src, "-o", dst]
@@ -352,6 +376,18 @@ class Install:
             cmd += ["--start", "%.3f" % offset]
         if max_height > 0:
             cmd += ["--max-output-height", str(max_height)]
+        if quality and quality != QUALITY_BALANCED:
+            cmd += ["--quality", quality]
+        if no_audio:
+            cmd.append("--no-audio")
+        if audio_from:
+            cmd += ["--audio-from", audio_from]
+            if audio_start > 0:
+                cmd += ["--audio-from-start", "%.3f" % audio_start]
+        if follow:
+            cmd.append("--follow")
+            if expect_frames > 0:
+                cmd += ["--expect-frames", str(expect_frames)]
         if stream:
             cmd.append("--stream")
         return cmd
@@ -681,14 +717,29 @@ def probe_source(path: str, ffmpeg_dir: str | None) -> Source | None:
 # --- The cache -------------------------------------------------------------
 
 
-def cache_key(source: Source, recipe: Recipe, decode_height: int = 0) -> str:
-    """One key per file, recipe and - when the source was decoded smaller
-    to keep a live render realtime - decode height, because that is a
-    different, lesser output."""
+def _smaller_decode(
+    a: tuple[int, int] | None, b: tuple[int, int] | None
+) -> tuple[int, int] | None:
+    """Whichever of two decode sizes is shorter; None counts as no limit."""
+    if a is None:
+        return b
+    if b is None:
+        return a
+    return a if a[1] <= b[1] else b
+
+
+def cache_key(
+    source: Source, recipe: Recipe, decode_height: int = 0, quality: str = QUALITY_BALANCED
+) -> str:
+    """One key per file, recipe, encoder quality and - when the source was
+    decoded smaller to keep a live render realtime, or capped by the height
+    limit - decode height, because each is a different output."""
     stat = os.stat(source.path)
     raw = f"{os.path.abspath(source.path)}|{stat.st_size}|{int(stat.st_mtime)}|{recipe.key}"
     if decode_height:
         raw += f"|h{decode_height}"
+    if quality and quality != QUALITY_BALANCED:
+        raw += f"|q{quality}"
     return hashlib.sha1(raw.encode("utf-8", "surrogateescape")).hexdigest()[:20]
 
 
@@ -943,10 +994,15 @@ class RenderJob(threading.Thread):
         stream: bool,
         offset: float = 0.0,
         decode: tuple[int, int] | None = None,
+        quality: str = QUALITY_BALANCED,
+        live_chain: bool = False,
     ):
         """*offset*: begin this many seconds into the source; such a render
         is for one sitting and is never cached. *decode*: the size to decode
-        the source at, when a live render has to be smaller to keep up."""
+        the source at, when a live render has to be smaller to keep up.
+        *quality*: the encoder effort. *live_chain*: run the two passes of a
+        chain at once, the upscaler following the interpolator's output, so
+        a live chain can start playing without waiting out the first pass."""
         super().__init__(name="video2x-render", daemon=True)
         self.install = install
         self.source = source
@@ -955,7 +1011,9 @@ class RenderJob(threading.Thread):
         self.stream = stream
         self.offset = max(0.0, offset)
         self.decode = decode
-        self.key = cache_key(source, recipe, decode[1] if decode else 0)
+        self.quality = quality
+        self.live_chain = bool(live_chain and stream and len(self.stages) == 2)
+        self.key = cache_key(source, recipe, decode[1] if decode else 0, quality)
         if self.offset:
             self.stem = partial_stem(self.key, self.offset)
             self.output = os.path.join(CACHE_DIR, self.stem + ".mkv")
@@ -966,6 +1024,7 @@ class RenderJob(threading.Thread):
         self.progress = Progress(stages=len(self.stages))
         self.cond = threading.Condition()
         self._tree: ProcessTree | None = None
+        self._aux_tree: ProcessTree | None = None  # the interpolator, in a live chain
         self._cancelled = False
         self._rate_anchor: tuple[float, int] | None = None
         self._rate_last: tuple[float, int] | None = None
@@ -1052,12 +1111,12 @@ class RenderJob(threading.Thread):
     def cancel(self) -> None:
         with self.cond:
             self._cancelled = True
-            tree = self._tree
+            trees = [t for t in (self._tree, self._aux_tree) if t is not None]
             # Waiters should not have to wait for the tree to die and the
             # pipe to drain before they learn this is over.
             self.progress.phase = "cancelled"
             self.cond.notify_all()
-        if tree is not None:
+        for tree in trees:
             tree.kill()
 
     # -- work ---------------------------------------------------------------
@@ -1084,6 +1143,10 @@ class RenderJob(threading.Thread):
         for stage in self.stages:
             if not self._ensure_engine(stage, *self.frame_size(stage)):
                 return
+
+        if self.live_chain:
+            self._run_live_chain()
+            return
 
         # Anything left over from a run that did not finish.
         for path in (self.output, self.marker):
@@ -1124,6 +1187,7 @@ class RenderJob(threading.Thread):
                     self.stream and is_last,
                     offset=self.offset if index == 0 else 0.0,
                     max_height=max_height,
+                    quality=self.quality,
                 ),
                 self._on_progress_line,
             )
@@ -1149,6 +1213,114 @@ class RenderJob(threading.Thread):
             except OSError:
                 pass
 
+        if self.marker:
+            with open(self.marker, "w", encoding="utf-8") as marker:
+                json.dump(
+                    {"source": src.path, "recipe": self.recipe.key, "decode": self.decode},
+                    marker,
+                )
+        self._set(phase="done")
+
+    def _run_live_chain(self) -> None:
+        """Interpolate and upscale at the same time.
+
+        The interpolator writes a video-only file that the upscaler follows
+        as it grows (--follow), so playback of the upscaled output can begin
+        without the whole interpolation pass finishing first. Sound comes
+        from the original, not the partial intermediate. The player watches
+        the upscaler, which is the last stage and the slower one.
+        """
+        src = self.source
+        interp, upscale = self.stages  # a chain is interpolate then upscale
+        intermediate = stage_path(self.stem, 0)
+        for path in (self.output, self.marker, intermediate):
+            if path:
+                try:
+                    os.remove(path)
+                except OSError:
+                    pass
+
+        src_frames = src.nb_frames
+        if self.offset and src.duration:
+            src_frames = max(1, int(round((src.duration - self.offset) * src.fps)))
+        interp_frames = interp.out_frames(src_frames)
+        final_frames = upscale.out_frames(interp_frames)
+
+        up_w, up_h = self.frame_size(upscale)
+        max_height = up_h * upscale.factor if self.decode else 0
+
+        cmd_interp = self.install.render_command(
+            interp, src.path, intermediate, stream=True,
+            offset=self.offset, quality=self.quality, no_audio=True,
+        )
+        cmd_upscale = self.install.render_command(
+            upscale, intermediate, self.output, stream=True,
+            max_height=max_height, quality=self.quality,
+            follow=True, expect_frames=interp_frames,
+            audio_from=src.path, audio_start=self.offset,
+        )
+
+        # The player follows the last stage; report it as that from the off.
+        self._set(phase="render", stage=1, frames_done=0,
+                  frames_total=final_frames, out_fps=0.0)
+        self._rate_anchor = self._rate_last = None
+
+        with self.cond:
+            if self._cancelled:
+                self._set(phase="cancelled")
+                return
+            try:
+                self._aux_tree = ProcessTree(
+                    cmd_interp, cwd=self.install.root, env=self.install.child_env(),
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                    creationflags=SUBPROCESS_FLAGS,
+                )
+            except OSError as error:
+                self._set(phase="failed", error=str(error))
+                return
+        logger.info("video2x: live chain, interpolating into %s", os.path.basename(intermediate))
+
+        # The upscaler cannot open the intermediate until a cluster of it
+        # exists; wait for the file to appear with something in it.
+        deadline = time.monotonic() + 30
+        while time.monotonic() < deadline:
+            if self._cancelled or self._aux_tree.proc.poll() is not None:
+                break
+            try:
+                if os.path.getsize(intermediate) > 65536:
+                    break
+            except OSError:
+                pass
+            time.sleep(0.1)
+
+        ok = self._run_child(cmd_upscale, self._on_progress_line)
+
+        with self.cond:
+            aux, self._aux_tree = self._aux_tree, None
+        if aux is not None:
+            aux.kill()
+            aux.close()
+        # Deliberately no _record_speed here: in a chain the upscaler spends
+        # most of its time waiting on the interpolator, so what it managed
+        # says nothing about what the GPU can do, and recording it would
+        # make every later live render decode far smaller than it needs to.
+
+        if self._cancelled:
+            self._set(phase="cancelled")
+            return
+        if not ok or not os.path.isfile(self.output) or os.path.getsize(self.output) == 0:
+            for path in (intermediate, self.output):
+                try:
+                    os.remove(path)
+                except OSError:
+                    pass
+            if ok:
+                self._set(phase="failed", error=_("The render produced no output."))
+            return
+        try:
+            os.remove(intermediate)
+        except OSError:
+            pass
         if self.marker:
             with open(self.marker, "w", encoding="utf-8") as marker:
                 json.dump(
@@ -1378,6 +1550,20 @@ class Video2X:
         return render if render in RENDER_INDEX_MAP else RENDER_PRE
 
     @property
+    def quality(self) -> str:
+        quality = self._settings.get_string("video2x-quality")
+        return quality if quality in QUALITY_INDEX_MAP else QUALITY_BALANCED
+
+    @property
+    def max_height(self) -> int:
+        """The user's output-height cap in lines, or 0 for none."""
+        return max(0, self._settings.get_int("video2x-max-height"))
+
+    @property
+    def save_beside(self) -> bool:
+        return self._settings.get_boolean("video2x-save-beside")
+
+    @property
     def cache_limit(self) -> int:
         """In bytes; the setting is in whole GB."""
         return max(1, self._settings.get_int("video2x-cache-limit")) * 1024**3
@@ -1514,13 +1700,19 @@ class Video2X:
             return None
 
         live = self.render == RENDER_LIVE
-        decode = self._fit_decode(source, recipe) if live else None
+        quality = self.quality
+        # The height cap applies to both timings; the live realtime fit only
+        # to live. The render is decoded at whichever is smaller.
+        decode = _smaller_decode(
+            self._fit_decode(source, recipe) if live else None,
+            self._cap_decode(source, recipe),
+        )
 
         # A complete render serves any session that would have settled for
         # its size: the full-size one serves everyone, one decoded smaller a
         # live session that planned on that size or a little more.
         for decode_height in self._acceptable_heights(source, decode):
-            key = cache_key(source, recipe, decode_height)
+            key = cache_key(source, recipe, decode_height, quality)
             output, marker = cache_paths(key)
             if os.path.isfile(marker) and os.path.isfile(output):
                 logger.info(
@@ -1542,8 +1734,8 @@ class Video2X:
         # Make room before, and hold the line after: the new render counts
         # against the limit as soon as it is complete.
         self.trim_cache()
-        job = self._start_or_join(install, source, recipe, offset, decode)
-        job.on_done = self.trim_cache
+        job = self._start_or_join(install, source, recipe, offset, decode, quality, live)
+        job.on_done = lambda: self._on_job_done(job)
         idle_add_once(self._show_progress, job)
 
         with self._jobs_lock:
@@ -1601,6 +1793,51 @@ class Video2X:
         parts.append(segment(job.output, 0.0, job.source.duration - job.offset))
         return "edl://" + ";".join(parts)
 
+    def _cap_decode(self, source: Source, recipe: Recipe) -> tuple[int, int] | None:
+        """The decode size that keeps the upscaler's output within the user's
+        height cap, or None when there is no cap, the last pass is not an
+        upscale (only it can be capped), or the output already fits."""
+        cap = self.max_height
+        stage = recipe.stages[-1]
+        if not cap or stage.kind != STAGE_UPSCALE:
+            return None
+        return decode_size(source, cap, stage.factor)
+
+    def _on_job_done(self, job: RenderJob) -> None:
+        """On the render thread, once a job is over: keep the cache in check
+        and, if asked, drop a copy of a finished full render beside its
+        source so it can be kept and used elsewhere."""
+        self.trim_cache()
+        if job.ok and not job.offset and self.save_beside:
+            try:
+                dest = self._save_beside(job)
+                if dest:
+                    idle_add_once(
+                        self._win.show_toast,
+                        _("Saved next to the original: %s") % os.path.basename(dest),
+                    )
+            except Exception as error:
+                logger.exception("video2x: could not save the render beside the original")
+                idle_add_once(
+                    self._win.show_toast,
+                    _("video2x: could not save beside the original (%s)") % error,
+                )
+
+    @staticmethod
+    def _save_beside(job: RenderJob) -> str | None:
+        src = job.source.path
+        folder = os.path.dirname(os.path.abspath(src))
+        stem = os.path.splitext(os.path.basename(src))[0]
+        suffix = job.recipe.key  # e.g. interp2+up4
+        dest = os.path.join(folder, f"{stem} [video2x {suffix}].mkv")
+        if os.path.isfile(dest) and os.path.getsize(dest) == os.path.getsize(job.output):
+            return None  # already there and the same size; nothing to do
+        tmp = dest + ".part"
+        shutil.copyfile(job.output, tmp)
+        os.replace(tmp, dest)
+        logger.info("video2x: saved a copy beside the original at %s", dest)
+        return dest
+
     def _fit_decode(self, source: Source, recipe: Recipe) -> tuple[int, int] | None:
         """The decode size at which a live render of *source* keeps up.
 
@@ -1646,9 +1883,10 @@ class Video2X:
         from just under the source down to a little below the plan."""
         heights = [0]
         if decode:
+            heights.append(decode[1])
             top = (source.height - 1) // DECODE_STEP * DECODE_STEP
             lowest = int(decode[1] * 0.85)
-            heights += list(range(top, lowest - 1, -DECODE_STEP))
+            heights += [h for h in range(top, lowest - 1, -DECODE_STEP) if h != decode[1]]
         return heights
 
     def _estimated_speed(
@@ -1672,15 +1910,18 @@ class Video2X:
         recipe: Recipe,
         offset: float,
         decode: tuple[int, int] | None,
+        quality: str,
+        live: bool,
     ) -> RenderJob:
-        key = cache_key(source, recipe, decode[1] if decode else 0)
+        key = cache_key(source, recipe, decode[1] if decode else 0, quality)
         stem = partial_stem(key, offset) if offset else key
         with self._jobs_lock:
             job = self._jobs.get(stem)
             if job is None or job.finished:
                 job = RenderJob(
                     install, source, recipe,
-                    stream=self.render == RENDER_LIVE, offset=offset, decode=decode,
+                    stream=live, offset=offset, decode=decode,
+                    quality=quality, live_chain=live and len(recipe.stages) == 2,
                 )
                 self._jobs[stem] = job
                 job.start()

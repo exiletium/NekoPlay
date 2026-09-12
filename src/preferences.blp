@@ -179,6 +179,39 @@ template $Preferences: Adw.Dialog {
 					};
 				}
 
+				Adw.ComboRow video2x_quality_row {
+					title: _("Render Quality");
+					subtitle: _("How hard the encoder works: faster and smaller, or slower and sharper");
+
+					model: Gtk.StringList {
+						strings [
+							_("Speed"),
+							_("Balanced"),
+							_("Quality"),
+						]
+					};
+				}
+
+				Adw.ComboRow video2x_max_height_row {
+					title: _("Maximum Render Height");
+					subtitle: _("Cap upscaled output to save time and space; interpolation is never capped");
+
+					model: Gtk.StringList {
+						strings [
+							_("No limit"),
+							_("1080p"),
+							_("1440p"),
+							_("2160p (4K)"),
+							_("2880p"),
+						]
+					};
+				}
+
+				Adw.SwitchRow video2x_save_beside_row {
+					title: _("Save Renders Beside the Original");
+					subtitle: _("Keep a copy of each finished render in the source's folder");
+				}
+
 				Adw.ActionRow {
 					title: _("Restore Saved Session");
 					subtitle: _("Pick up where you left off after saving from the menu");

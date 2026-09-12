@@ -87,5 +87,18 @@
 			<range min="1" max="2000"/>
 			<summary>Most the rendered-video cache may hold, in GB; the oldest renders go first</summary>
 		</key>
+		<key name="video2x-quality" type="s">
+			<default>"balanced"</default>
+			<summary>speed, balanced or quality: the encoder effort video2x spends</summary>
+		</key>
+		<key name="video2x-max-height" type="i">
+			<default>0</default>
+			<range min="0" max="4320"/>
+			<summary>Cap the rendered height in lines (0 = full); only the upscaler can be capped</summary>
+		</key>
+		<key name="video2x-save-beside" type="b">
+			<default>false</default>
+			<summary>Also write each finished render beside its source file</summary>
+		</key>
 	</schema>
 </schemalist>

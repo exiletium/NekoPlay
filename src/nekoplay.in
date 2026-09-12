@@ -124,6 +124,15 @@ if os.name == 'nt':
     # usable as an escape hatch if the GPU path ever misbehaves.
     os.environ.setdefault('GDK_WIN32_FORCE_DCOMP', '1')
 
+    # GTK 4.20 started creating D3D11 *and* D3D12 devices while opening the
+    # display. Both are built whether or not anything asks for them, and on
+    # this machine the D3D12 one alone costs ~115 ms of the ~240 ms that
+    # gdk_win32_display_open takes - all of it waiting, with no CPU time on
+    # any thread. Nothing here uses it: GSK is pinned to the GL renderer
+    # below, and DirectComposition interops through the D3D11 device, which
+    # is why d3d11 has to stay (disabling it segfaults GDK when DComp is on).
+    os.environ.setdefault('GDK_DISABLE', 'd3d12')
+
     # fontconfig reads XDG_DATA_DIRS itself and splits it on ':', the POSIX
     # convention. A Windows path starts 'C:', so the drive letter tears the
     # entry in half and it ends up scanning nonsense like 'C:/.../share/;C/fonts'.

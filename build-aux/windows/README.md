@@ -231,8 +231,7 @@ Two timings, in Preferences under **AI Render Timing**:
   with a progress toast that can cancel; cancelling plays the original.
   Full quality and full seeking.
 - **Live** opens the output once ~4 s of it exist past where playback will
-  start and plays it as it grows. In a chain that wait includes every pass
-  before the last, since only the last writes the file played. When the
+  start and plays it as it grows. When the
   render is slower than playback the player pauses with "Rendering ahead…"
   on the OSD and continues once the render is 4 s ahead again, like
   buffering a stream. mpv follows a growing file as long as it never reads
@@ -274,6 +273,28 @@ interpolation stalls under `--max-output-height` at present, so in a
 chain RIFE runs at the source's size and the upscaler scales its output
 down as it reads it.
 
+In live mode a two-pass chain runs both passes at once rather than
+waiting out the interpolation first. The interpolator writes a video-only
+intermediate; the upscaler reads it while it is still being written
+(video2x's `--follow`, with `--expect-frames` because a followed stream
+never signals EOF) and takes its sound from the original rather than the
+partial intermediate (`--audio-from`). Measured on the test clip: playback
+begins 14.6 s in instead of after the whole 2× pass. The upscaler's rate
+is deliberately *not* folded into the speed record on this path - in a
+chain it spends most of its time waiting on the interpolator, so what it
+manages says nothing about the GPU.
+
+Three more settings sit in Preferences. **Render Quality** (speed /
+balanced / quality) is video2x's `--quality`. **Maximum Render Height**
+caps the upscaler's output (`--max-output-height`), which mostly buys
+time: capping the test clip's ×4 to 1080 lines took the render from ~40 s
+to 5.5 s. Only the upscaler can be capped - see the note on interpolation
+above - and the cap is part of the cache key, so a capped render and a
+full one are separate entries. **Save Renders Beside the Original** drops
+a copy of each finished full render next to its source as
+`<name> [video2x <recipe>].mkv`; partial renders made for one seek are
+never saved.
+
 Measured on a 608×1080 30 fps clip on an RX 9060 XT (1080p screen):
 interpolate 2× runs at 4.0× realtime; upscale ×4 at full size (to
 2432×4320) at 0.79×, so the first live session pauses once; fitted, it
@@ -310,6 +331,24 @@ synchronously from the main loop every 2 ms measured its own interference
 (+187 ms) and nothing else. Measured over five loops of a 15 s clip: median
 -45 ms, i.e. the wrap lands inside the last frame (42 ms at 24 fps) with no
 stall; bare mpv on the same content gives -16 ms.
+
+## Startup
+
+`NEKOPLAY_TRACE=1` prints milestones to the log. Warm, the window is up
+and the file playing about 875 ms in. The single largest item used to be
+`gdk_win32_display_open`, which took ~240 ms while using no CPU at all on
+any thread - it was waiting, not working. GTK 4.20 began creating D3D11
+*and* D3D12 devices there whether or not anything asks for them; the D3D12
+one alone accounts for ~115 ms of that. Nothing here uses it (GSK is
+pinned to the GL renderer, and DirectComposition interops through the
+D3D11 device), so the launcher sets `GDK_DISABLE=d3d12`, which takes the
+display open from ~240 ms to ~120 ms. `d3d11` has to stay: disabling it
+while DComp is on segfaults GDK.
+
+What is left is mostly GTK and libadwaita loading, which is not something
+the app can avoid. Since a second launch now hands its file to the running
+instance and exits (see above), that cost is paid once per session rather
+than once per file.
 
 ## What still costs more than mpv, and why
 

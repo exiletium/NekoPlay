@@ -111,6 +111,9 @@ class Preferences(Adw.Dialog):
     video2x_cache_row: Adw.ActionRow = Gtk.Template.Child()
     video2x_cache_btn: Gtk.Button = Gtk.Template.Child()
     video2x_cache_limit_row: Adw.SpinRow = Gtk.Template.Child()
+    video2x_quality_row: Adw.ComboRow = Gtk.Template.Child()
+    video2x_max_height_row: Adw.ComboRow = Gtk.Template.Child()
+    video2x_save_beside_row: Adw.SwitchRow = Gtk.Template.Child()
 
     def __init__(self, window, **kwargs):
         super().__init__(**kwargs)
@@ -286,6 +289,22 @@ class Preferences(Adw.Dialog):
         self.video2x_cache_limit_row.connect(
             "notify::value", self._on_video2x_cache_limit_changed
         )
+        self.video2x_quality_row.set_selected(
+            video2x.QUALITY_TO_INDEX.get(settings.get_string("video2x-quality"), 1)
+        )
+        self.video2x_quality_row.connect(
+            "notify::selected", self._on_video2x_quality_changed
+        )
+        self.video2x_max_height_row.set_selected(
+            video2x.MAX_HEIGHT_TO_INDEX.get(settings.get_int("video2x-max-height"), 0)
+        )
+        self.video2x_max_height_row.connect(
+            "notify::selected", self._on_video2x_max_height_changed
+        )
+        self.video2x_save_beside_row.set_active(settings.get_boolean("video2x-save-beside"))
+        self.video2x_save_beside_row.connect(
+            "notify::active", self._on_video2x_save_beside_changed
+        )
         self._refresh_video2x_rows()
 
     def _refresh_video2x_rows(self):
@@ -363,6 +382,27 @@ class Preferences(Adw.Dialog):
         freed = video2x.clear_cache()
         self._refresh_video2x_rows()
         self._win.show_toast(_("Freed %s") % GLib.format_size(freed))
+
+    def _on_video2x_quality_changed(self, row, *a):
+        idx = row.get_selected()
+        value = (
+            video2x.QUALITY_INDEX_MAP[idx]
+            if idx < len(video2x.QUALITY_INDEX_MAP)
+            else video2x.QUALITY_BALANCED
+        )
+        settings.set_string("video2x-quality", value)
+
+    def _on_video2x_max_height_changed(self, row, *a):
+        idx = row.get_selected()
+        value = (
+            video2x.MAX_HEIGHT_INDEX_MAP[idx]
+            if idx < len(video2x.MAX_HEIGHT_INDEX_MAP)
+            else 0
+        )
+        settings.set_int("video2x-max-height", value)
+
+    def _on_video2x_save_beside_changed(self, row, *a):
+        settings.set_boolean("video2x-save-beside", row.get_active())
 
     def _on_sub_color_selected(self, color_btn, *arg):
         rgba = color_btn.get_rgba()
