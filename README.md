@@ -75,14 +75,10 @@ In case you want to support Nyarch, here is the Nyarch Linux donation button
 
 ### Install
 
-You can install from the .flatpak file from latest release on any distribution:
-
 On Windows, run `NekoPlay-Setup.exe`, or unpack the portable `NekoPlay`
-folder anywhere and run `nekoplay.exe` — either way nothing else is needed.
+folder anywhere and run `nekoplay.exe`.
 
 ### Build from source
-
-Clone the repo in GNOME Builder and press run.
 
 For Windows, build in an MSYS2 UCRT64 shell:
 
