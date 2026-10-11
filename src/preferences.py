@@ -241,10 +241,7 @@ class Preferences(Adw.Dialog):
             return
 
         for w in self._win.app.get_windows():
-            if w.thumb_area:
-                w.thumb_area.unrealize()
-                w.thumb_area.unmap()
-                w.thumb_area = None
+            w.drop_thumb_preview()
 
     def _on_offload_changed(self, settings, key):
         self._win.offload.set_enabled(

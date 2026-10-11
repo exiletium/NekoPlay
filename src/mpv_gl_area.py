@@ -170,12 +170,33 @@ class ThumbPreviewGLArea(BaseGLArea):
 
         self._time = None
         self._is_seeking = False
+        # Called once on the main loop when the file load_file opened has its
+        # first frame; armed by that file's file-loaded, so a restart left
+        # over from a seek in the last file cannot set it off early.
+        self._on_loaded = None
+        self._loaded_armed = False
 
         @self._mpv.property_observer("seeking")
         def on_seeking_change(_name, seeking):
             if not seeking:
                 self._is_seeking = False
                 self._flush_seek()
+
+        @self._mpv.event_callback("file-loaded")
+        def on_file_loaded(_event):
+            self._loaded_armed = True
+
+        @self._mpv.event_callback("playback-restart")
+        def on_playback_restart(_event):
+            if not self._loaded_armed:
+                return
+            callback, self._on_loaded = self._on_loaded, None
+            self._loaded_armed = False
+            if callback is not None:
+                GLib.idle_add(
+                    lambda: callback() and False,
+                    priority=GLib.PRIORITY_HIGH_IDLE,  # type: ignore
+                )
 
     def _on_realize(self, _area):
         try:
@@ -198,7 +219,9 @@ class ThumbPreviewGLArea(BaseGLArea):
             self._mpv = None
             self._ctx = None
 
-    def load_file(self, path, start=None) -> bool:
+    def load_file(self, path, start=None, on_loaded=None) -> bool:
+        """Open *path*, from *start*, and call *on_loaded* on the main loop
+        once its first frame is in."""
         try:
             assert self._mpv is not None
             # mpv hands back a name that is not valid UTF-8 as bytes, which
@@ -207,6 +230,8 @@ class ThumbPreviewGLArea(BaseGLArea):
             # A seek still waiting was meant for the last file.
             self._time = None
             self._is_seeking = False
+            self._loaded_armed = False
+            self._on_loaded = on_loaded
             if start:
                 self._mpv.command("loadfile", target, "replace", -1, f"start={start:.3f}")
             else:

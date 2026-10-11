@@ -620,8 +620,18 @@ class CineWindow(Adw.ApplicationWindow):
         progress_hover.connect("leave", self._on_progress_leave)
         self.video_progress_scale.add_controller(progress_hover)
 
+        # A middle click jumps to the start of the chapter under the pointer.
+        # Taken before GtkRange sees it, and claimed, because GtkRange grabs
+        # the knob for any button: it would drag it, or seek to the pointer
+        # right after the jump.
         prog_mid_click = Gtk.GestureClick(button=2)
-        prog_mid_click.connect("pressed", self._go_to_chapter_start)
+        prog_mid_click.set_propagation_phase(Gtk.PropagationPhase.CAPTURE)
+
+        def on_mid_pressed(gesture, *args):
+            gesture.set_state(Gtk.EventSequenceState.CLAIMED)
+            self._go_to_chapter_start()
+
+        prog_mid_click.connect("pressed", on_mid_pressed)
         self.video_progress_scale.add_controller(prog_mid_click)
 
         for c in self.video_progress_scale.observe_controllers():
@@ -1173,6 +1183,17 @@ class CineWindow(Adw.ApplicationWindow):
         # busy every frame would starve an idle source indefinitely.
         self._thumb_timeout_id = GLib.timeout_add(THUMB_PREVIEW_DELAY_MS, on_timeout)
 
+    def drop_thumb_preview(self):
+        """Shut the thumbnail player down and take it off screen."""
+        if self.thumb_area is None:
+            return
+        self.thumb_area.unrealize()
+        self.thumb_area.unmap()
+        self.thumb_area = None
+        self.thumb_frame.set_child(None)
+        self.tooltip_thumb_revealer.set_reveal_child(False)
+        self._thumb_gen = -1
+
     def _thumb_current(self) -> bool:
         """Whether the thumbnail player holds the file that is playing."""
         return self._thumb_gen == self._load_gen
@@ -1233,16 +1254,29 @@ class CineWindow(Adw.ApplicationWindow):
         if self._is_audio:
             a.stop()
             self._thumb_gen = gen
-        # Opened where the pointer rests, if it does: a seek sent to a file
-        # that is still opening would be refused.
-        elif a.load_file(path, self._resting_hover_time()):
-            self._thumb_gen = gen
+            return
+        # Opened where the pointer rests, if it does, since a seek sent to a
+        # file that is still opening would be refused. It only counts as
+        # current once that file's first frame is in: until then the area
+        # would draw the last file's.
+        pointer = self._bar_pointer
+        a.load_file(
+            path,
+            self._resting_hover_time(),
+            on_loaded=lambda: self._thumb_loaded(gen, pointer),
+        )
 
-        # A pointer resting on the bar gets the thumbnail where it is.
+    def _thumb_loaded(self, gen, pointer):
+        """The thumbnail player has the first frame of load *gen*, opened
+        for a pointer resting at *pointer*."""
+        if self._closing or gen != self._load_gen:
+            return  # replaced since
+        self._thumb_gen = gen
+        # Show it where the pointer is now; it was opened where it was then.
         if self._bar_pointer is not None:
             x, y = self._bar_pointer
             self._set_time_tooltip()
-            self._on_progress_motion(None, x, y, seek_thumb=False)
+            self._on_progress_motion(None, x, y, seek_thumb=self._bar_pointer != pointer)
 
     def _resting_hover_time(self) -> float | None:
         """The time under a pointer resting on the seek bar, if one is."""
@@ -1291,10 +1325,9 @@ class CineWindow(Adw.ApplicationWindow):
             return
 
         # The pointer may have been on the bar since before this file
-        # started, with no enter event to hand the thumbnail player its file;
-        # handing it over redraws the tooltip here.
-        if self._thumb_pending is not None and self._ensure_thumb_preview():
-            return
+        # started, with no enter event to hand the thumbnail player its file.
+        if self._thumb_pending is not None:
+            self._ensure_thumb_preview()
         current = self._thumb_current()
         show_thumb = self.thumb_area is not None and not self._is_audio and current
 
@@ -1312,13 +1345,13 @@ class CineWindow(Adw.ApplicationWindow):
         self._hover_time = percentage * self.duration
 
         title = None
+        # Before the first chapter there is none to jump to.
+        self._curr_chapter_time = None
         if self._chapters:
             idx = bisect.bisect_right(self.chapter_times, self._hover_time) - 1
             if idx >= 0:
                 self._curr_chapter_time = self.chapter_times[idx]
                 title = self.chapter_titles[idx]
-        else:
-            self._curr_chapter_time = None
 
         time_str = format_time(self._hover_time)
         text = f"{time_str} ‐ <b>{title}</b>" if title else time_str
@@ -1426,6 +1459,8 @@ class CineWindow(Adw.ApplicationWindow):
         self._prev_prog_time = curr_time
 
     def _update_chapter_marks_and_menu(self, chapters):
+        # The last hover was over the last file's chapters.
+        self._curr_chapter_time = None
         if not chapters:
             self.video_progress_scale.clear_marks()
             self.chapters_menu_btn.set_visible(False)
@@ -1577,15 +1612,7 @@ class CineWindow(Adw.ApplicationWindow):
         self.skip_pause_obs_count = 0
         self.mpv.command_async("cycle", "pause")
 
-    def _on_progress_pressed(self, gesture=None, *args):
-        # GtkRange's drag gesture answers every button, but only the primary
-        # one moves the knob; a middle click is the jump to a chapter start.
-        # (Touch reports no button at all.)
-        if gesture is not None and gesture.get_current_button() not in (
-            0,
-            Gdk.BUTTON_PRIMARY,
-        ):
-            return
+    def _on_progress_pressed(self, *args):
         self._dragging_progress = True
         if self._skip_reset_id:
             GLib.source_remove(self._skip_reset_id)
@@ -2182,9 +2209,7 @@ class CineWindow(Adw.ApplicationWindow):
                 # frame is up (see on_playback_restart); until then it still
                 # holds the last one, which must not stay on screen.
                 if self.thumb_area and not self._wants_thumb_preview():
-                    self.thumb_area.unrealize()
-                    self.thumb_area.unmap()
-                    self.thumb_area = None
+                    self.drop_thumb_preview()
                 elif self.thumb_area and not self._thumb_current():
                     self.tooltip_thumb_revealer.set_reveal_child(False)
 
