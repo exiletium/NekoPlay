@@ -88,6 +88,59 @@ gtk_setts: Gtk.Settings | None = Gtk.Settings.get_default()
 
 DEFAULT_WIDTH, DEFAULT_HEIGHT = 1120, 630
 
+# What the main thread needs to know about the player, kept current by
+# observers so it never has to ask. See CineWindow.prop().
+STATE_PROPS = (
+    "chapter",
+    "cursor-autohide-fs-only",
+    "duration",
+    "idle-active",
+    "loop-file",
+    "loop-playlist",
+    "media-title",
+    "metadata",
+    "mute",
+    "pause",
+    "playlist-count",
+    "playlist-pos",
+    "sid",
+    "speed",
+    "time-pos",
+    "volume",
+)
+
+# How long after the first frame the seek-bar thumbnail player opens its copy
+# of the file, unless the pointer reaches the bar first. It is a second mpv
+# with its own GL context, demuxer and decoder, and starting it alongside the
+# main one put all of that in front of the first frame.
+THUMB_PREVIEW_DELAY_MS = 1000
+
+
+class MPV(mpv.MPV):
+    """python-mpv, observing each property once however many handlers it has.
+
+    python-mpv asks mpv to observe a property again for every handler added,
+    mpv sends one event per observation, and python-mpv hands every event to
+    every handler. Two handlers on time-pos made two events a frame and four
+    calls; one observation per name makes it one event and two calls.
+    """
+
+    def observe_property(self, name, handler):
+        handlers = self._property_handlers[name]
+        if not handlers:
+            super().observe_property(name, handler)
+            return
+        handlers.append(handler)
+        # mpv sends a property's current value once, when it is first
+        # observed - possibly before this handler was in the list. Observing
+        # it afresh sends the value again, to every handler, and still
+        # leaves one observation behind.
+        key = hash(name) & 0xFFFFFFFFFFFFFFFF
+        mpv._mpv_unobserve_property(self._event_handle, key)
+        mpv._mpv_observe_property(
+            self._event_handle, key, name.encode("utf-8"), mpv.MpvFormat.NODE
+        )
+
 
 @Gtk.Template(resource_path="/moe/nyarchlinux/nekoplay/window.ui")
 class CineWindow(Adw.ApplicationWindow):
@@ -145,6 +198,7 @@ class CineWindow(Adw.ApplicationWindow):
 
     def __init__(self, is_activate=False, **kwargs):
         super().__init__(**kwargs)
+        trace("window template built")
         self.app: Adw.Application = cast(Adw.Application, kwargs.get("application"))
         self._mpris: MPRIS = self.app.mpris  # type: ignore
 
@@ -191,6 +245,8 @@ class CineWindow(Adw.ApplicationWindow):
         self._thumb_w: int = 1280
         self.is_local_path: bool = True
         self._prog_fine_tune: bool = False
+        self._dragging_progress: bool = False
+        self._drag_seek_target: float | None = None
         self._error_count: int = 0
         self._pressed_combos: set[str] = set()
         self._hide_timeout_id: int = 0
@@ -198,8 +254,28 @@ class CineWindow(Adw.ApplicationWindow):
         self._is_inactive: bool = False
         self._loop_seams: list[float] = []  # see _loop_probe
         self._mpv_ctx: mpv.MpvRenderContext
+        # The seek-bar tenth last handed to the main loop, and whether that
+        # update is still waiting to run. See on_time_change.
+        self._sent_prog_tenth: float | None = None
+        self._prog_update_queued: bool = False
+        # What the thumbnail player needs to open the current file, captured
+        # on mpv's event thread once its first frame is up; None when there
+        # is nothing for it to do. See _ensure_thumb_preview.
+        self._thumb_pending: tuple | None = None
+        self._thumb_timeout_id: int = 0
+        # The last value mpv reported for each of STATE_PROPS. The main thread
+        # reads these through prop() instead of asking mpv: a synchronous read
+        # waits for mpv's core thread, which can be busy for a long time while
+        # a file opens - in one measured startup a single read of
+        # playlist-count waited 160 ms, and the first frame waited with it,
+        # because mpv needs the main thread to draw that frame.
+        self._state: dict[str, object] = {
+            "idle-active": True,
+            "playlist-count": 0,
+            "playlist-pos": -1,
+        }
 
-        self.mpv = mpv.MPV(
+        self.mpv = MPV(
             # terminal=True,
             # log_handler=print,
             loglevel="info",
@@ -211,6 +287,17 @@ class CineWindow(Adw.ApplicationWindow):
             input_builtin_bindings=False,
             input_vo_keyboard=True,
             load_scripts=True,
+            # mpv starts each of its own scripts on a thread with a Lua state
+            # of its own, as soon as it is created. These four are never
+            # used here - the OSC and the console are switched off below,
+            # and select and commands only draw through the console - so
+            # they are not started at all: 3 ms off creating the player, and
+            # as much again off opening each file. (A user's mpv.conf is read
+            # after this, and can still turn them on.)
+            osc=False,
+            load_console=False,
+            load_select=False,
+            load_commands=False,
             audio_display="embedded-first",
             audio_file_auto="fuzzy",
             sub_auto="fuzzy",
@@ -263,6 +350,14 @@ class CineWindow(Adw.ApplicationWindow):
 
         trace("mpv created")
 
+        # Registered before every other observer, so that by the time any of
+        # them hands work to the main loop the state it reads is current.
+        def remember(name, value):
+            self._state[name] = value
+
+        for name in STATE_PROPS:
+            self.mpv.observe_property(name, remember)
+
         self._video_area = VideoGLArea(self.mpv)
         self.offload: Gtk.GraphicsOffload = Gtk.GraphicsOffload(child=self._video_area)
         self.offload.set_black_background(True)
@@ -290,6 +385,11 @@ class CineWindow(Adw.ApplicationWindow):
 
         self._setup_actions()
         self._setup_widgets()
+        # Every window opens with its controls showing, and hides them a
+        # moment into playback. That used to fall out of mpv first reporting
+        # itself idle, which no longer happens when the file is handed over
+        # before the window is shown (see CineApplication.do_open).
+        self.revealer_ui.set_reveal_child(True)
         strip_popover_arrows(self)
         self._setup_observers()
         self.video2x = Video2X(self, settings)
@@ -402,6 +502,7 @@ class CineWindow(Adw.ApplicationWindow):
             widget.set_direction(Gtk.TextDirection.LTR)
 
         max_vol = cast(int, self.mpv.volume_max)
+        self._volume_max = float(max_vol)
         self.volume_scale_adj.set_upper(max_vol)
 
         self.mute_handler_id = self.mute_toggle_btn.connect(
@@ -478,7 +579,7 @@ class CineWindow(Adw.ApplicationWindow):
         self.add_controller(key_controller)
 
         progress_hover = Gtk.EventControllerMotion()
-        progress_hover.connect("enter", self._set_time_tooltip)
+        progress_hover.connect("enter", self._on_progress_enter)
         progress_hover.connect("motion", self._on_progress_motion)
         progress_hover.connect("leave", self._hide_time_tooltip)
         self.video_progress_scale.add_controller(progress_hover)
@@ -612,7 +713,7 @@ class CineWindow(Adw.ApplicationWindow):
 
         try:
             if not is_fullscreen:
-                self.mpv.fullscreen = is_fullscreen
+                self.mpv.command_async("set", "fullscreen", "no")
         except mpv.ShutdownError:
             pass
 
@@ -643,7 +744,7 @@ class CineWindow(Adw.ApplicationWindow):
             header_hover = self.motion_header.props.contains_pointer
 
             active_or_hover = (
-                self.mpv.idle_active
+                self.prop("idle-active")
                 or header_hover
                 or controls_hover
                 or self.primary_menu_btn.props.active
@@ -660,7 +761,7 @@ class CineWindow(Adw.ApplicationWindow):
                 self._hide_time_tooltip()
 
             if (
-                (self._is_fullscreen or not self.mpv["cursor-autohide-fs-only"])
+                (self._is_fullscreen or not self.prop("cursor-autohide-fs-only"))
                 and not active_or_hover
                 and not self.props.dialogs
             ):
@@ -771,7 +872,7 @@ class CineWindow(Adw.ApplicationWindow):
         self._actions[name] = action
 
     def _on_open_playlist(self, *args):
-        if self.mpv.idle_active:
+        if self.prop("idle-active"):
             return
         playlist = Playlist(self)
         strip_popover_arrows(playlist)
@@ -781,7 +882,7 @@ class CineWindow(Adw.ApplicationWindow):
         add_mode = action.props.name != "open-folder"
         title = _("Add Folder") if add_mode else _("Open Folder")
         dialog = Gtk.FileDialog(title=title)
-        curr_path = self.mpv.path
+        curr_path = self._video_path
 
         if isinstance(curr_path, str) and os.path.exists(curr_path):
             folder_path = os.path.dirname(curr_path)
@@ -826,7 +927,7 @@ class CineWindow(Adw.ApplicationWindow):
         dialog.set_filters(filters_list)
         dialog.set_default_filter(filter)
 
-        curr_path = self.mpv.path
+        curr_path = self._video_path
         if isinstance(curr_path, str) and os.path.exists(curr_path):
             folder_path = os.path.dirname(curr_path)
             dialog.set_initial_folder(Gio.File.new_for_path(folder_path))
@@ -891,7 +992,7 @@ class CineWindow(Adw.ApplicationWindow):
         self.audio_tracks_menu_btn.popup()
 
     def _on_open_chapters_menu(self, *args):
-        if not self.mpv.chapters:
+        if not self._chapters:
             return
         self._show_ui()
         self.chapters_menu_btn.popup()
@@ -942,11 +1043,11 @@ class CineWindow(Adw.ApplicationWindow):
         content_box.append(btn_open)
         dialog = Adw.Dialog(content_width=450, child=view, default_widget=btn_open)
         self.url = ""
+        protocol_list = cast(list, self.mpv.protocol_list)
 
         def is_valid_input(text):
             url = text.strip()
             parsed = urlparse(url)
-            protocol_list = cast(list, self.mpv.protocol_list)
             path_exists = os.path.exists(url)
             if parsed.scheme in protocol_list or path_exists:
                 self.url = url
@@ -976,7 +1077,7 @@ class CineWindow(Adw.ApplicationWindow):
             if not (text := clipboard.read_text_finish(result)):
                 return
 
-            if urlparse(text).scheme in cast(list, self.mpv.protocol_list):
+            if urlparse(text).scheme in protocol_list:
                 entry_row.insert_text(text, 0)
 
         if display and (clipboard := display.get_clipboard()):
@@ -989,22 +1090,80 @@ class CineWindow(Adw.ApplicationWindow):
         self._on_open_url(add=True)
         return Gdk.EVENT_STOP
 
-    def setup_thumb_preview(self):
+    def _wants_thumb_preview(self) -> bool:
+        return settings.get_boolean("thumbnail-preview") and self.is_local_path
+
+    def _thumb_source(self) -> tuple | None:
+        """What the thumbnail player needs from this one: the file, the
+        decoder setting, and the video's size if it has one.
+
+        Every item is a read that waits on mpv, so outside of the preferences
+        switch this runs on mpv's event thread, after the first frame.
+        """
+        try:
+            has_video = bool(self.mpv.vid)
+            return (
+                self.mpv.path,
+                self.mpv.hwdec,
+                self.mpv.width if has_video else None,
+                self.mpv.height if has_video else None,
+            )
+        except mpv.ShutdownError:
+            return None
+        except Exception:
+            logger.exception("Could not read what the thumbnail player needs")
+            return None
+
+    def _schedule_thumb_preview(self):
+        """Open the thumbnail player a moment after the first frame, once
+        playback has settled - or sooner, if the pointer reaches the bar."""
+        if self._thumb_timeout_id:
+            GLib.source_remove(self._thumb_timeout_id)
+            self._thumb_timeout_id = 0
+        if self._thumb_pending is None:
+            return
+        if not self._wants_thumb_preview():
+            self._thumb_pending = None
+            return
+
+        def on_timeout():
+            self._thumb_timeout_id = 0
+            self._ensure_thumb_preview()
+            return GLib.SOURCE_REMOVE
+
+        # Default priority, not idle: a renderer that keeps the main loop
+        # busy every frame would starve an idle source indefinitely.
+        self._thumb_timeout_id = GLib.timeout_add(THUMB_PREVIEW_DELAY_MS, on_timeout)
+
+    def _ensure_thumb_preview(self):
+        """Give the thumbnail player the current file, if it is still waiting."""
+        source, self._thumb_pending = self._thumb_pending, None
+        if self._thumb_timeout_id:
+            GLib.source_remove(self._thumb_timeout_id)
+            self._thumb_timeout_id = 0
+        if source is not None and self._wants_thumb_preview():
+            self.setup_thumb_preview(source)
+
+    def setup_thumb_preview(self, source=None):
+        """Size the seek-bar thumbnail and open the current file in it.
+
+        *source* is what _thumb_source() captured; without it (the setting
+        was just switched on) it is read here.
+        """
+        if source is None:
+            source = self._thumb_source()
+            if source is None:
+                return
+        path, hwdec, width, height = source
+
         if not self.thumb_area:
-            self.thumb_area = ThumbPreviewGLArea(self.mpv.hwdec)
+            self.thumb_area = ThumbPreviewGLArea(hwdec)
             self.thumb_frame.set_child(self.thumb_area)
             self.thumb_area.realize()
 
         v_width, v_height = 1280, 720
-
-        try:
-            if self.mpv.vid:
-                self.mpv.wait_for_property("width", timeout=2)
-                self.mpv.wait_for_property("height", timeout=2)
-                v_width = cast(int, self.mpv.width)
-                v_height = cast(int, self.mpv.height)
-        except Exception:
-            logger.exception("Failed to get video w/h")
+        if width and height:
+            v_width, v_height = int(width), int(height)
 
         if v_width >= v_height:  # Horizontal or square
             width = 200
@@ -1018,7 +1177,11 @@ class CineWindow(Adw.ApplicationWindow):
         self._thumb_w = width
         self.thumb_area.set_size_request(width, height)
         a = self.thumb_area
-        a.stop() if self._is_audio else a.load_file(self._video_path)
+        a.stop() if self._is_audio else a.load_file(path)
+
+    def _on_progress_enter(self, *args):
+        self._ensure_thumb_preview()
+        self._set_time_tooltip()
 
     def _hide_time_tooltip(self, *args):
         self.prev_reveal = False
@@ -1029,7 +1192,7 @@ class CineWindow(Adw.ApplicationWindow):
         self._prev_prog_motion_xy = (-1, -1)  # triggers _on_progress_motion
         self.width = self.get_width()
         self.prog_width = self.video_progress_scale.get_width()
-        self.duration = float(self.mpv.duration or 0)
+        self.duration = float(self.prop("duration", 0))
         self.prev_reveal = False
 
     def _move_time_tooltip(self, revealer, layer: Gtk.Fixed, x, tooltip_w):
@@ -1112,8 +1275,8 @@ class CineWindow(Adw.ApplicationWindow):
         return True
 
     def _update_volume_icon(self):
-        volume = cast(float, self.mpv.volume)
-        is_muted = self.mpv.mute
+        volume = cast(float, self.prop("volume", 0))
+        is_muted = self.prop("mute")
 
         if is_muted or volume == 0:
             icon = "cine-volume-mute-symbolic"
@@ -1135,12 +1298,19 @@ class CineWindow(Adw.ApplicationWindow):
     def _toggle_elapsed_remaining(self, _btn):
         self._show_remaining = not self._show_remaining
         settings.set_boolean("show-remaining", self._show_remaining)
-        pos = float(self.mpv.time_pos or 0)
+        pos = float(self.prop("time-pos", 0))
         self._update_progress(pos, update_bar=False)
         self._set_time_margin()
 
+    def _flush_progress(self):
+        self._prog_update_queued = False
+        self._update_progress(float(self.prop("time-pos", 0)))
+
     def _update_progress(self, curr_time, update_bar=True):
         curr_time = round(curr_time, 1)
+        # The slider is under the pointer while it is dragged; the position a
+        # keyframe seek lands on would only drag it back.
+        update_bar = update_bar and not self._dragging_progress
 
         if update_bar and curr_time == self._prev_prog_time:
             return
@@ -1152,7 +1322,7 @@ class CineWindow(Adw.ApplicationWindow):
 
         try:
             if self._show_remaining:
-                duration = float(self.mpv.duration or 0)
+                duration = float(self.prop("duration", 0))
                 remaining = (duration - curr_time) if duration > curr_time else 0
                 self.time_elapsed_label.props.label = f"-{format_time(remaining)}"
             else:
@@ -1188,11 +1358,14 @@ class CineWindow(Adw.ApplicationWindow):
             self.chapter_titles.append(GLib.markup_escape_text(title))
 
     def _navigate_playlist(self, direction: int):
-        pos = int(self.mpv.playlist_pos or 0)
-        count = int(self.mpv.playlist_count or 0)
+        pos = max(0, int(self.prop("playlist-pos", 0)))
+        count = int(self.prop("playlist-count", 0))
 
         if count > 0:
-            self.mpv.playlist_pos = (pos + direction) % count
+            target = (pos + direction) % count
+            self.mpv.command_async("set", "playlist-pos", target)
+            # So a second press before mpv reports back moves on from here.
+            self._state["playlist-pos"] = target
 
     @Gtk.Template.Callback()
     def on_previous_clicked(self, *args):
@@ -1204,34 +1377,34 @@ class CineWindow(Adw.ApplicationWindow):
 
     @Gtk.Template.Callback()
     def on_skip_90_clicked(self, *args):
-        self.mpv.seek(90, reference="relative")
+        self.mpv.command_async("seek", 90, "relative+keyframes")
 
     def _on_subtitle_selected(self, action, parameter):
         self.mpv.command_async("set", "sub-visibility", "yes")
         track_id = parameter.get_int32()
-        self.mpv.sid = track_id if track_id > 0 else "no"
+        self.mpv.command_async("set", "sid", track_id if track_id > 0 else "no")
         action.set_state(parameter)
 
     def _on_audio_selected(self, action, parameter):
         track_id = parameter.get_int32()
-        self.mpv.aid = track_id
+        self.mpv.command_async("set", "aid", track_id)
         action.set_state(parameter)
 
     def _on_video_selected(self, action, parameter):
         track_id = parameter.get_int32()
-        self.mpv.vid = track_id
+        self.mpv.command_async("set", "vid", track_id)
         action.set_state(parameter)
 
     def _on_chapter_selected(self, action, parameter):
         chapter_index = parameter.get_int32()
-        self.mpv.chapter = chapter_index
+        self.mpv.command_async("set", "chapter", chapter_index)
         action.set_state(parameter)
 
     @Gtk.Template.Callback()
     def _sync_chapter_menu_selected(self, *args):
         if action := self.lookup_action("select-chapter"):
             action.set_state(  # pyright: ignore[reportAttributeAccessIssue]
-                GLib.Variant("i", self.mpv.chapter)
+                GLib.Variant("i", self.prop("chapter", 0))
             )
 
     def _update_play_pause_icon(self, paused):
@@ -1309,27 +1482,40 @@ class CineWindow(Adw.ApplicationWindow):
         self.mpv.command_async("cycle", "pause")
 
     def _on_progress_pressed(self, *args):
+        self._dragging_progress = True
         try:
-            self._playing_on_press = not self.mpv.pause
+            self._playing_on_press = not self.prop("pause")
             if self._playing_on_press:
                 self.skip_pause_obs_count += 1
-                self.mpv.command("set", "pause", "yes")
+                self.mpv.command_async("set", "pause", "yes")
         except Exception:
             logger.exception("_on_progress_pressed failed")
             self.skip_pause_obs_count = 0
 
     def _on_progress_released(self, *args):
+        self._dragging_progress = False
+        target, self._drag_seek_target = self._drag_seek_target, None
+        if target is not None:
+            self.mpv.command_async("seek", target, "absolute")
         try:
             if self._playing_on_press:
                 self.skip_pause_obs_count += 1
                 self._playing_on_press = False
-                self.mpv.command("set", "pause", "no")
+                self.mpv.command_async("set", "pause", "no")
         except Exception:
             logger.exception("_on_progress_released failed")
             self.skip_pause_obs_count = 0
 
     def _on_progress_adjusted(self, adjustment):
-        self.mpv.command_async("seek", adjustment.props.value, "absolute")
+        value = adjustment.props.value
+        if self._dragging_progress:
+            # Keyframes only while the slider moves: each lands at once,
+            # where an exact seek would decode its way to a frame the next
+            # motion has already made stale. Release seeks exactly.
+            self._drag_seek_target = value
+            self.mpv.command_async("seek", value, "absolute+keyframes")
+        else:
+            self.mpv.command_async("seek", value, "absolute")
 
     @Gtk.Template.Callback()
     def _on_shuffle_toggled(self, button):
@@ -1346,16 +1532,16 @@ class CineWindow(Adw.ApplicationWindow):
 
     def _on_ab_loop_btn_toggled(self, button):
         if not button or not button.get_active():
-            self.mpv.ab_loop_a = False
-            self.mpv.ab_loop_b = False
+            self.mpv.command_async("set", "ab-loop-a", "no")
+            self.mpv.command_async("set", "ab-loop-b", "no")
         else:
             self.mpv.command_async("ab-loop")
 
     def _update_loop_state(self):
         icon_loop = "cine-playlist-repeat-symbolic"
         icon_loop_file = "cine-repeat-file-symbolic"
-        is_file = self.mpv.loop_file
-        is_playlist = self.mpv.loop_playlist
+        is_file = self.prop("loop-file")
+        is_playlist = self.prop("loop-playlist")
 
         if is_playlist:
             self._loop_mode = "playlist"
@@ -1380,22 +1566,20 @@ class CineWindow(Adw.ApplicationWindow):
         next_modes = {"off": "playlist", "playlist": "file", "file": "off"}
         curr_mode = self._loop_mode
         target_mode = next_modes[curr_mode]
-        if target_mode == "playlist":
-            self.mpv.loop_file = "no"
-            self.mpv.loop_playlist = "inf"
-        elif target_mode == "file":
-            self.mpv.loop_file = "inf"
-            self.mpv.loop_playlist = "no"
-        elif target_mode == "off":
-            self.mpv.loop_file = "no"
-            self.mpv.loop_playlist = "no"
+        loop_file, loop_playlist = {
+            "playlist": ("no", "inf"),
+            "file": ("inf", "no"),
+            "off": ("no", "no"),
+        }[target_mode]
+        self.mpv.command_async("set", "loop-file", loop_file)
+        self.mpv.command_async("set", "loop-playlist", loop_playlist)
 
     def _sync_can_prev_next(self):
         try:
-            count: int = cast(int, self.mpv.playlist_count) or 0
-            pos: int = cast(int, self.mpv.playlist_pos) or 0
+            count: int = cast(int, self.prop("playlist-count", 0))
+            pos: int = cast(int, self.prop("playlist-pos", 0))
             has_multiple: bool = count > 1
-            loop_list_on: bool = self.mpv.loop_playlist is not False and has_multiple
+            loop_list_on: bool = self.prop("loop-playlist", False) is not False and has_multiple
 
             self.can_go_prev = loop_list_on or (has_multiple and pos > 0)
             self.can_go_next = loop_list_on or (has_multiple and pos < count - 1)
@@ -1455,7 +1639,7 @@ class CineWindow(Adw.ApplicationWindow):
 
             name = (item.get_basename() or "").lower()
             if name.endswith(SUB_EXTS):
-                if not self.mpv.idle_active:
+                if not self.prop("idle-active"):
                     self.mpv.command_async("sub-add", path, "select")
                 continue
 
@@ -1491,11 +1675,7 @@ class CineWindow(Adw.ApplicationWindow):
             self._space_holding = True
 
             try:
-                self.mpv.pause = False
-                self._prev_speed = cast(float, self.mpv.speed)
-                new_speed = self._prev_speed * 2
-                self.mpv.speed = new_speed
-                self.mpv.show_text(f"{new_speed:g}× ⯈⯈", "100000000")
+                self._start_fast_forward()
             except mpv.ShutdownError:
                 pass
         else:
@@ -1508,8 +1688,7 @@ class CineWindow(Adw.ApplicationWindow):
             if self._space_pressed:
                 self._space_pressed = False
                 try:
-                    self.mpv.speed = self._prev_speed
-                    self.mpv.show_text(f"{self.mpv.speed:g}×")
+                    self._stop_fast_forward()
                 except mpv.ShutdownError:
                     pass
 
@@ -1616,14 +1795,22 @@ class CineWindow(Adw.ApplicationWindow):
                 return
 
             self._click_holding = True
-            self.mpv.pause = False
-            self._prev_speed = cast(float, self.mpv.speed)
-            new_speed = self._prev_speed * 2
-            self.mpv.speed = new_speed
-            self.mpv.show_text(f"{new_speed:g}× ⯈⯈", "100000000")
+            self._start_fast_forward()
             gesture.set_state(Gtk.EventSequenceState.CLAIMED)
         except mpv.ShutdownError:
             pass
+
+    def _start_fast_forward(self):
+        """Play at twice the speed for as long as a key or button is held."""
+        self._prev_speed = float(self.prop("speed", 1.0))
+        new_speed = self._prev_speed * 2
+        self.mpv.command_async("set", "pause", "no")
+        self.mpv.command_async("set", "speed", new_speed)
+        self.mpv.command_async("show-text", f"{new_speed:g}× ⯈⯈", "100000000")
+
+    def _stop_fast_forward(self):
+        self.mpv.command_async("set", "speed", self._prev_speed)
+        self.mpv.command_async("show-text", f"{self._prev_speed:g}×")
 
     def _run_command(self, cmd):
         try:
@@ -1675,8 +1862,7 @@ class CineWindow(Adw.ApplicationWindow):
         if not self._click_holding:
             return
         try:
-            self.mpv.speed = self._prev_speed
-            self.mpv.show_text(f"{self.mpv.speed:g}×")
+            self._stop_fast_forward()
             self._click_holding = False
         except mpv.ShutdownError:
             pass
@@ -1724,7 +1910,7 @@ class CineWindow(Adw.ApplicationWindow):
         direction: Gdk.ScrollDirection = event.get_direction()
         rel_dir: Gdk.ScrollRelativeDirection = event.get_relative_direction()  # type: ignore
         is_natural: bool = rel_dir == Gdk.ScrollRelativeDirection.INVERTED  # type: ignore
-        max_vol = cast(float, self.mpv.volume_max)
+        max_vol = self._volume_max
         step = dy if direction == Gdk.ScrollDirection.SMOOTH else dy * 5
 
         if is_natural:
@@ -1769,7 +1955,7 @@ class CineWindow(Adw.ApplicationWindow):
 
     def _sync_inhibit(self):
         try:
-            should_inhibit = not self.mpv.pause and not self.mpv.idle_active
+            should_inhibit = not self.prop("pause") and not self.prop("idle-active")
         except mpv.ShutdownError:
             should_inhibit = False
 
@@ -1781,7 +1967,7 @@ class CineWindow(Adw.ApplicationWindow):
 
     def _show_icon_indicator(self):
         try:
-            if self.mpv.idle_active or self._click_delay_id:
+            if self.prop("idle-active") or self._click_delay_id:
                 return
         except mpv.ShutdownError:
             pass
@@ -1793,6 +1979,9 @@ class CineWindow(Adw.ApplicationWindow):
     def do_close_request(self) -> bool:
         # A render still going is for a playback that is about to end.
         self.video2x.cancel_all()
+        # A load held for a render context that will now never exist would
+        # keep mpv from quitting.
+        self._video_area.release_loads()
         try:
             same_playlist = is_same_playlist(self.mpv.playlist)
             save_pos = settings.get_boolean("save-video-position")
@@ -1844,17 +2033,17 @@ class CineWindow(Adw.ApplicationWindow):
         def on_start_file(_event):
             idle_add_once(self.spinner.set_visible, True)
 
-        def on_f_loaded():
+        def on_f_loaded(path):
             try:
                 self.spinner.set_visible(False)
-                self.is_local_path = is_local_path(self.mpv.path)
+                self.is_local_path = is_local_path(path)
                 self.start_page.set_sensitive(True)
                 self.hide_ui_timeout()
                 self._on_ab_loop_btn_toggled(None)
 
-                if settings.get_boolean("thumbnail-preview") and self.is_local_path:
-                    self.setup_thumb_preview()
-                elif self.thumb_area:
+                # The thumbnail player is given this file once its first
+                # frame is up; see on_playback_restart.
+                if self.thumb_area and not self._wants_thumb_preview():
                     self.thumb_area.unrealize()
                     self.thumb_area.unmap()
                     self.thumb_area = None
@@ -1865,11 +2054,32 @@ class CineWindow(Adw.ApplicationWindow):
             except mpv.ShutdownError:
                 pass
 
+        # Event thread only: whether the next playback-restart is the first
+        # one of a newly loaded file.
+        first_restart = False
+
         @self.mpv.event_callback("file-loaded")
         def on_file_loaded(_event):
+            nonlocal first_restart
             trace("file loaded")
-            idle_add_once(on_f_loaded)
+            first_restart = True
+            self._thumb_pending = None
+            idle_add_once(on_f_loaded, self.mpv.path)
             timeout_add_seconds_once(5, setattr, self, "_error_count", 0)
+
+        @self.mpv.event_callback("playback-restart")
+        def on_playback_restart(_event):
+            nonlocal first_restart
+            if TRACE:
+                # A load or a seek is done once its first frame is on screen.
+                trace("playback restarted")
+                self._video_area.trace_next_frame = True
+            if first_restart:
+                first_restart = False
+                # Read here rather than on the main thread, where each of
+                # these reads would wait for mpv.
+                self._thumb_pending = self._thumb_source()
+                idle_add_once(self._schedule_thumb_preview)
 
         @self.mpv.event_callback("end-file")
         def on_end_file(event):
@@ -1983,11 +2193,13 @@ class CineWindow(Adw.ApplicationWindow):
         def sync_loop(name, value):
             new_mode = "no"
             if name == "loop-playlist" and value == "inf":
-                self.mpv.loop_file = False
+                self.mpv.command_async("set", "loop-file", "no")
+                self._state["loop-file"] = False
                 new_mode = "playlist"
                 self._sync_can_prev_next()
             elif name == "loop-file" and value == "inf":
-                self.mpv.loop_playlist = False
+                self.mpv.command_async("set", "loop-playlist", "no")
+                self._state["loop-playlist"] = False
                 new_mode = "file"
             elif name == "loop-playlist":
                 self._sync_can_prev_next()
@@ -2020,38 +2232,53 @@ class CineWindow(Adw.ApplicationWindow):
 
         @self.mpv.property_observer("time-pos")
         def on_time_change(_name, value):
-            idle_add_once(self._update_progress, float(value or 0))
+            pos = float(value or 0)
             if TRACE and value is not None:
-                self._loop_probe(float(value))
+                self._loop_probe(pos)
+            # mpv reports every frame, and the bar and the clock show tenths
+            # at most. Wake the main loop only when what they show changes,
+            # and not again until that update has run.
+            tenth = round(pos, 1)
+            if tenth == self._sent_prog_tenth:
+                return
+            self._sent_prog_tenth = tenth
+            if not self._prog_update_queued:
+                self._prog_update_queued = True
+                idle_add_once(self._flush_progress)
 
         @self.mpv.property_observer("seeking")
         def on_seeking_change(_name, seeking):
-            if not seeking:
-                idle_add_once(self._mpris.emit_seeked)
+            if not seeking and self._mpris.connected:
+                idle_add_once(self._mpris.emit_seeked, self.mpv.time_pos)
 
         @self.mpv.property_observer("duration")
         def on_duration_change(_name, value):
             self._loop_duration = float(value or 0)
             idle_add_once(self._update_duration, float(value or 0))
 
-        def sync_mute(muted):
+        def show_icon_requested() -> bool:
+            """Whether the key that made this change asked for the on-screen
+            icon. Event thread only: it waits on mpv."""
+            try:
+                return (self.mpv.user_data or {}).get("show-icon") == "yes"
+            except mpv.ShutdownError:
+                return False
+
+        def sync_mute(muted, show_icon):
             self.mute_toggle_btn.handler_block(self.mute_handler_id)
             self.mute_toggle_btn.set_active(muted)
             self.mute_toggle_btn.handler_unblock(self.mute_handler_id)
             self._update_volume_icon()
-            user_data = cast(dict, self.mpv.user_data)
-            show_icon = user_data.get("show-icon")
 
-            if show_icon == "yes":
+            if show_icon:
                 self.icon_indicator.props.icon_name = (
                     self.volume_menu_btn.props.icon_name
                 )
                 self._show_icon_indicator()
-                user_data["show-icon"] = None
 
         @self.mpv.property_observer("mute")
         def on_mute_change(_name, muted):
-            idle_add_once(sync_mute, muted)
+            idle_add_once(sync_mute, muted, show_icon_requested())
 
         def update_icon_and_vol_adj(value):
             vol = int(value)
@@ -2060,11 +2287,11 @@ class CineWindow(Adw.ApplicationWindow):
             self.volume_scale_adj.set_value(vol)
             self.volume_scale.handler_unblock(self.volume_handler_id)
 
-            if vol > 0 and self.mpv.mute:
-                self.mpv.mute = False
+            if vol > 0 and self.prop("mute"):
+                self.mpv.command_async("set", "mute", "no")
 
             if self.volume_menu_btn.props.active:
-                self.mpv.show_text(_("Volume") + f": {vol}%")
+                self.mpv.command_async("show-text", _("Volume") + f": {vol}%")
 
             self._update_volume_icon()
             settings.set_int("volume", vol)
@@ -2158,16 +2385,16 @@ class CineWindow(Adw.ApplicationWindow):
             self._is_startup = False
             idle_add_once(sync_idle_active, is_idle)
 
-        def sync_title(title):
+        def sync_title(title, filename):
             try:
-                if title == self.mpv.filename:
+                if title == filename:
                     title_no_ext = os.path.splitext(title)[0]
                     self.set_title(title_no_ext)
                     self.title_widget.set_title(title_no_ext)
                 else:
                     self.set_title(title)
                     self.title_widget.set_title(title)
-                    pos = abs(cast(int, self.mpv.playlist_pos))
+                    pos = abs(cast(int, self.prop("playlist-pos", 0)))
                     if obj := cast(PlaylistItemObj, self.playlist_ls.get_item(pos)):
                         obj.notify("playing")
 
@@ -2179,41 +2406,32 @@ class CineWindow(Adw.ApplicationWindow):
         @self.mpv.property_observer("media-title")
         def on_title_change(_name, title):
             if title:
-                idle_add_once(sync_title, title)
+                idle_add_once(sync_title, title, self.mpv.filename)
 
         @self.mpv.property_observer("sub-scale")
         def on_sub_scale_change(_name, value):
             if self._visible_dialog is None:
                 idle_add_once(settings.set_double, "subtitle-scale", value)
 
-        def set_sub_icon(name, value):
-            try:
-                sub_on_icon = "cine-subtitles-symbolic"
-                sub_off_icon = "cine-subtitles-off-symbolic"
+        def set_sub_icon(name, value, show_icon):
+            sub_on_icon = "cine-subtitles-symbolic"
+            sub_off_icon = "cine-subtitles-off-symbolic"
 
-                sub_on = (value == "auto" or value) and self.mpv.sid
-                self.subtitles_menu_btn.props.icon_name = (
-                    sub_on_icon if sub_on else sub_off_icon
-                )
+            sub_on = (value == "auto" or value) and self.prop("sid")
+            self.subtitles_menu_btn.props.icon_name = (
+                sub_on_icon if sub_on else sub_off_icon
+            )
 
-                if name != "sub-visibility":
-                    return
-
-                user_data = cast(dict, self.mpv.user_data)
-                show_icon = user_data.get("show-icon")
-
-                if show_icon == "yes":
-                    icon = sub_on_icon if sub_on else sub_off_icon
-                    self.icon_indicator.props.icon_name = icon
-                    self._show_icon_indicator()
-                    user_data["show-icon"] = None
-            except mpv.ShutdownError:
-                pass
+            if show_icon:
+                icon = sub_on_icon if sub_on else sub_off_icon
+                self.icon_indicator.props.icon_name = icon
+                self._show_icon_indicator()
 
         @self.mpv.property_observer("sub-visibility")
         @self.mpv.property_observer("sid")
         def on_sub_vis_change(name, value):
-            idle_add_once(set_sub_icon, name, value)
+            show_icon = name == "sub-visibility" and show_icon_requested()
+            idle_add_once(set_sub_icon, name, value, show_icon)
 
         def set_aid_icon(value):
             audio_on = value == "auto" or value
@@ -2249,6 +2467,18 @@ class CineWindow(Adw.ApplicationWindow):
         @self.mpv.event_callback("shutdown")
         def on_quit(_event):
             idle_add_once(self.close)
+
+    @property
+    def can_load_before_present(self) -> bool:
+        """Whether files may be handed to mpv before the window is shown;
+        see VideoGLArea._hold_loads."""
+        return self._video_area.holds_loads
+
+    def prop(self, name: str, default=None):
+        """The last value mpv reported for one of STATE_PROPS, or *default*
+        while it has none. Never waits on mpv, so safe on the main thread."""
+        value = self._state.get(name)
+        return default if value is None else value
 
     def _connect(self, signal_name):
         return lambda func: self.connect(signal_name, func)

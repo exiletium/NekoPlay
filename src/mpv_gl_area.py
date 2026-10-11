@@ -18,6 +18,7 @@
 
 import ctypes
 import logging
+import threading
 
 import gi
 import mpv
@@ -39,6 +40,19 @@ logger = logging.getLogger(__name__)
 
 DISPLAY_PARAM = get_display_param()
 
+# python-mpv has no binding for libmpv's hook API, only for the event it
+# delivers. The function objects are shared with python-mpv, which never
+# calls these two, so setting their signatures here is safe.
+_hook_add = mpv.backend.mpv_hook_add
+_hook_add.argtypes = [mpv.MpvHandle, ctypes.c_uint64, ctypes.c_char_p, ctypes.c_int]
+_hook_add.restype = ctypes.c_int
+_hook_continue = mpv.backend.mpv_hook_continue
+_hook_continue.argtypes = [mpv.MpvHandle, ctypes.c_uint64]
+_hook_continue.restype = ctypes.c_int
+
+# Tells our on_preloaded hook's events apart from anyone else's.
+_PRELOADED_HOOK = 0x6E656B6F
+
 
 class BaseGLArea(Gtk.GLArea):
     def __init__(self, **kwargs):
@@ -46,6 +60,7 @@ class BaseGLArea(Gtk.GLArea):
         self._ctx: mpv.MpvRenderContext | None = None
         self._mpv: mpv.MPV | None = None
         self._fbo = ctypes.c_int()
+        self._render_queued = False
         self.connect("realize", self._on_realize)
         self.connect("render", self._on_render)
 
@@ -73,11 +88,23 @@ class BaseGLArea(Gtk.GLArea):
         its locks, so it must not call back into mpv - a property read from
         here deadlocks against a property write on the main thread. Nothing
         but the redraw request belongs here.
+
+        mpv calls this for the OSD and for state changes as well as frames,
+        often several times before the main loop gets a turn; one request
+        waiting is enough, since a render always draws the latest frame.
         """
+        if self._render_queued:
+            return
+        self._render_queued = True
         GLib.idle_add(
-            self.queue_render,
+            self._queue_render_once,
             priority=GLib.PRIORITY_HIGH_IDLE,  # type: ignore
         )
+
+    def _queue_render_once(self):
+        self._render_queued = False
+        self.queue_render()
+        return GLib.SOURCE_REMOVE
 
     def _on_realize(self, _area):
         raise NotImplementedError("Subclasses must implement _on_realize")
@@ -207,10 +234,79 @@ class VideoGLArea(BaseGLArea):
     def __init__(self, mpv_instance: mpv.MPV, **kwargs):
         super().__init__(**kwargs)
         self._mpv = mpv_instance
+        # Set from mpv's event thread on playback-restart (NEKOPLAY_TRACE
+        # only), so the trace can say when that frame reached the screen.
+        self.trace_next_frame = False
+
+        self._gate_lock = threading.Lock()
+        self._gate_open = False
+        self._held: list[int] = []
+        self.holds_loads = self._hold_loads()
+
+    def _hold_loads(self) -> bool:
+        """Let mpv open a file before this area exists on screen.
+
+        With vo=libmpv, mpv makes its video output as soon as it knows a
+        file's tracks, and that fails outright - the file then plays without
+        video - unless the render context already exists. The render context
+        needs this area realized, and that needs the window shown, so a file
+        could not be handed to mpv until all of that was done.
+
+        An on_preloaded hook holds each load at the last point before the
+        video output is made, and lets it go once the render context is up:
+        reading the file's headers, finding its tracks and loading external
+        subtitles all happen while the window is still being realized.
+        Returns False if the hook could not be set, in which case nothing is
+        held and loads must wait for the window as before.
+        """
+        try:
+            handle = self._mpv._event_handle
+
+            @self._mpv.event_callback(mpv.MpvEventID.HOOK)
+            def on_hook(event):
+                if event.reply_userdata != _PRELOADED_HOOK:
+                    return
+                hook_id = event.data.id
+                with self._gate_lock:
+                    if not self._gate_open:
+                        self._held.append(hook_id)
+                        trace("load held for the render context")
+                        return
+                _hook_continue(handle, hook_id)
+
+            if _hook_add(handle, _PRELOADED_HOOK, b"on_preloaded", 0) < 0:
+                raise RuntimeError("mpv_hook_add failed")
+            return True
+        except Exception:
+            logger.exception("Could not hold loads for the render context")
+            self._gate_open = True
+            return False
+
+    def release_loads(self):
+        """Let every load through from now on, including any being held.
+        Called once the render context is up, or failed to come up, and when
+        the window closes - mpv waits on a held hook even to quit."""
+        with self._gate_lock:
+            self._gate_open = True
+            held, self._held = self._held, []
+        for hook_id in held:
+            try:
+                _hook_continue(self._mpv._event_handle, hook_id)
+            except Exception:
+                logger.exception("Could not release a held load")
+
+    def _on_render(self, area, context):
+        super()._on_render(area, context)
+        if self.trace_next_frame:
+            self.trace_next_frame = False
+            trace("frame drawn")
 
     def _on_realize(self, _area):
         trace("GL area realize")
-        self.make_current()
-        trace("GL context current")
-        self._ctx = self._setup_mpv_context(self._mpv)
-        trace("mpv render context up")
+        try:
+            self.make_current()
+            trace("GL context current")
+            self._ctx = self._setup_mpv_context(self._mpv)
+            trace("mpv render context up")
+        finally:
+            self.release_loads()

@@ -155,8 +155,8 @@ class MPRIS:
         )
 
         if self._mpv:
-            status = "Paused" if self._mpv.pause else "Playing"
-            vol = self._mpv.volume
+            status = "Paused" if self._prop("pause") else "Playing"
+            vol = self._prop("volume", 0)
             loop = self._get_loop_status()
 
             self._emit_props_changed(
@@ -164,7 +164,7 @@ class MPRIS:
                     "PlaybackStatus": GLib.Variant("s", status),
                     "LoopStatus": GLib.Variant("s", loop),
                     "Metadata": self._get_metadata_variant()
-                    if not self._mpv.idle_active
+                    if not self._prop("idle-active", True)
                     else GLib.Variant("a{sv}", {}),
                     "CanPlay": GLib.Variant("b", True),
                     "CanPause": GLib.Variant("b", True),
@@ -178,9 +178,25 @@ class MPRIS:
             )
 
     @property
+    def connected(self) -> bool:
+        """Whether anyone can hear us. Never on Windows."""
+        return self._con is not None
+
+    @property
     def _mpv(self):
         win = self._app.props.active_window
         return getattr(win, "mpv", None)
+
+    def _prop(self, name, default=None):
+        """The active window's last known value of an mpv property.
+
+        Everything here runs on the main thread, where asking mpv directly
+        waits for its core - and D-Bus clients such as the shell's media
+        controls ask for Position and Metadata whenever they like.
+        """
+        win = self._app.props.active_window
+        prop = getattr(win, "prop", None)
+        return prop(name, default) if prop else default
 
     @property
     def _can_go_prev(self):
@@ -204,8 +220,8 @@ class MPRIS:
                 return "None"
 
             # mpv loop-playlist can be 'inf', 'no', or a number
-            loop_playlist = getattr(p, "loop_playlist", "no")
-            loop_file = getattr(p, "loop_file", "no")
+            loop_playlist = self._prop("loop-playlist", "no")
+            loop_file = self._prop("loop-file", "no")
 
             if loop_file == "inf":
                 return "Track"
@@ -217,22 +233,32 @@ class MPRIS:
         return "None"
 
     def update_playback_status(self, paused):
+        if not self._con:
+            return
         status = "Paused" if paused else "Playing"
         self._emit_props_changed({"PlaybackStatus": GLib.Variant("s", status)})
 
     def update_volume(self, value):
+        if not self._con:
+            return
         vol = value / 100.0
         self._emit_props_changed({"Volume": GLib.Variant("d", float(vol))})
 
     def update_metadata(self):
+        if not self._con:
+            return
         metadata = self._get_metadata_variant()
         self._emit_props_changed({"Metadata": metadata})
 
     def update_loop(self):
+        if not self._con:
+            return
         current_loop = self._get_loop_status()
         self._emit_props_changed({"LoopStatus": GLib.Variant("s", current_loop)})
 
     def update_can_prev_next(self, can_prev, can_next):
+        if not self._con:
+            return
         self._emit_props_changed({"CanGoPrevious": GLib.Variant("b", can_prev)})
         self._emit_props_changed({"CanGoNext": GLib.Variant("b", can_next)})
 
@@ -245,9 +271,7 @@ class MPRIS:
         metadata = {}
 
         try:
-            duration = getattr(self._mpv, "duration", 0)
-            if duration is None:
-                duration = 0
+            duration = self._prop("duration", 0)
 
             metadata = {
                 "mpris:trackid": GLib.Variant("o", "/org/mpris/MediaPlayer2/Track/0"),
@@ -256,12 +280,12 @@ class MPRIS:
 
             win = self._app.props.active_window
             window_title = win.props.title if win else None
-            title = window_title or getattr(self._mpv, "media_title", None)
+            title = window_title or self._prop("media-title")
 
             if title:
                 metadata["xesam:title"] = GLib.Variant("s", str(title))
 
-            md = self._mpv.metadata if self._mpv else {}
+            md = self._prop("metadata", {})
 
             if artist := (md or {}).get("artist"):
                 metadata["xesam:artist"] = GLib.Variant("as", [str(artist)])
@@ -285,11 +309,11 @@ class MPRIS:
             win.skip_pause_obs_count = 0  # type: ignore
 
             if method == "PlayPause":
-                p.pause = not p.pause
+                p.command_async("cycle", "pause")
             elif method == "Pause":
-                p.pause = True
+                p.command_async("set", "pause", "yes")
             elif method == "Play":
-                p.pause = False
+                p.command_async("set", "pause", "no")
             elif method == "Previous":
                 if win.can_go_prev:  # type: ignore
                     win.on_previous_clicked()  # type: ignore
@@ -297,17 +321,18 @@ class MPRIS:
                 if win.can_go_next:  # type: ignore
                     win.on_next_clicked()  # type: ignore
             elif method == "Stop":
-                p.stop()
+                p.command_async("stop")
                 self.update_props()
             elif method == "Seek":
                 offset_usec = params.get_child_value(0).get_int64()
-                current_pos = getattr(p, "time_pos", 0)
-                p.time_pos = current_pos + (offset_usec / 1_000_000.0)
-                self.emit_seeked()
+                target = self._prop("time-pos", 0) + (offset_usec / 1_000_000.0)
+                p.command_async("seek", target, "absolute")
+                self.emit_seeked(target)
             elif method == "SetPosition":
                 pos_usec = params.get_child_value(1).get_int64()
-                p.time_pos = pos_usec / 1_000_000.0
-                self.emit_seeked()
+                target = pos_usec / 1_000_000.0
+                p.command_async("seek", target, "absolute")
+                self.emit_seeked(target)
             elif method == "Raise":
                 win.present()
             elif method == "Quit":
@@ -317,13 +342,12 @@ class MPRIS:
         except Exception:
             logger.exception("_handle_method failed")
 
-    def emit_seeked(self):
+    def emit_seeked(self, raw_pos=None):
         try:
             if not self._con or not self._mpv:
                 return
-            raw_pos = getattr(self._mpv, "time_pos", 0)
             if raw_pos is None:
-                raw_pos = 0
+                raw_pos = self._prop("time-pos", 0)
             pos_usec = int(raw_pos * 1_000_000)
             self._con.emit_signal(
                 None,
@@ -347,17 +371,15 @@ class MPRIS:
                 elif prop in ["CanPlay", "CanPause", "CanControl", "CanSeek"]:
                     return GLib.Variant("b", True)
                 elif prop == "Volume":
-                    vol = p.volume / 100.0 if p else 0.0
+                    vol = self._prop("volume", 0) / 100.0 if p else 0.0
                     return GLib.Variant("d", float(vol))
                 elif prop == "PlaybackStatus":
-                    status = "Paused" if (p and p.pause) else "Playing"
+                    status = "Paused" if (p and self._prop("pause")) else "Playing"
                     return GLib.Variant("s", status)
                 elif prop == "LoopStatus":
                     return GLib.Variant("s", self._get_loop_status())
                 elif prop == "Position":
-                    raw_pos = getattr(p, "time_pos", 0)
-                    if raw_pos is None:
-                        raw_pos = 0
+                    raw_pos = self._prop("time-pos", 0)
                     pos = int(raw_pos * 1_000_000)
                     return GLib.Variant("x", pos)
                 elif prop == "Metadata":
@@ -389,21 +411,18 @@ class MPRIS:
 
             if prop == "Volume":
                 new_vol = value.get_double()
-                p.volume = new_vol * 100.0
+                p.command_async("set", "volume", new_vol * 100.0)
                 self._emit_props_changed({"Volume": GLib.Variant("d", float(new_vol))})
                 return True
 
             if prop == "LoopStatus":
                 new_loop = value.get_string()
-                if new_loop == "None":
-                    p.loop_playlist = "no"
-                    p.loop_file = "no"
-                elif new_loop == "Track":
-                    p.loop_file = "inf"
-                    p.loop_playlist = "no"
-                elif new_loop == "Playlist":
-                    p.loop_file = "no"
-                    p.loop_playlist = "inf"
+                loop_file, loop_playlist = {
+                    "Track": ("inf", "no"),
+                    "Playlist": ("no", "inf"),
+                }.get(new_loop, ("no", "no"))
+                p.command_async("set", "loop-file", loop_file)
+                p.command_async("set", "loop-playlist", loop_playlist)
                 self._emit_props_changed({"LoopStatus": GLib.Variant("s", new_loop)})
                 return True
 

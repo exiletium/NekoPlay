@@ -32,7 +32,10 @@ NekoPlay is a fork of [Cine](https://github.com/diegopvlk/Cine) but with a few e
 >   "save beside the original" are in Preferences.
 > - **GPU compositing on by default** (DirectComposition), which took 4K60
 >   playback from 88% of a CPU core to 51%.
-> - **Startup work**, ending at roughly 950 ms warm to the first frame.
+> - **Startup work**, ending at roughly 950 ms warm to the first frame, and
+>   a later pass that keeps the UI thread from ever waiting on mpv, opens
+>   the file while the window is still being built, and starts the
+>   thumbnail player after the first frame rather than before it.
 >
 > The details, and the measurements behind each claim, are in
 > [`build-aux/windows/README.md`](build-aux/windows/README.md).

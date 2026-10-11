@@ -40,6 +40,9 @@ logger = logging.getLogger(__name__)
 
 _lock = threading.Lock()
 _cache: dict[str, tuple[int, int] | None] = {}
+# Probes under way, so that asking for one waits for it rather than
+# starting a second ffprobe on the same file.
+_running: dict[str, threading.Event] = {}
 
 
 def _run_ffprobe(path: str) -> tuple[int, int] | None:
@@ -100,20 +103,46 @@ def _run_ffprobe(path: str) -> tuple[int, int] | None:
     return width, height
 
 
+def _key(path: str) -> str:
+    """One spelling per file. The prefetch sees the command line as typed,
+    possibly relative, while the window asks with the absolute path GIO
+    resolved; keyed apart, every relative launch missed and paid for a
+    second, synchronous ffprobe (~80 ms) right before the window appeared."""
+    return os.path.normcase(os.path.abspath(path))
+
+
 def video_size(path: str) -> tuple[int, int] | None:
     """Ask for a file's display size, using the prefetched answer if there is one.
 
     Blocks for as long as an ffprobe run takes on a miss, which is what the
     caller used to do unconditionally.
     """
+    key = _key(path)
     with _lock:
-        if path in _cache:
-            return _cache[path]
+        if key in _cache:
+            return _cache[key]
+        running = _running.get(key)
+        if running is None:
+            running = _running[key] = threading.Event()
+            mine = True
+        else:
+            mine = False
 
-    size = _run_ffprobe(path)
-    with _lock:
-        _cache.setdefault(path, size)
-        return _cache[path]
+    if not mine:
+        # ffprobe's own timeout bounds this; a little slack covers startup.
+        running.wait(3)
+        with _lock:
+            return _cache.get(key)
+
+    try:
+        size = _run_ffprobe(path)
+        with _lock:
+            _cache.setdefault(key, size)
+            return _cache[key]
+    finally:
+        with _lock:
+            _running.pop(key, None)
+        running.set()
 
 
 def prefetch(paths) -> None:

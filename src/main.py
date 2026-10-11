@@ -53,6 +53,16 @@ else:
     # Set the icon shown in gnome sound settings
     os.environ["PIPEWIRE_PROPS"] = '{application.icon-name="moe.nyarchlinux.nekoplay"}'
 
+# The app forces libadwaita's dark style (see do_startup), but the style
+# manager is created following the system's preference, which is light on
+# most desktops, and switching it then cost 30-55 ms of startup restyling
+# every widget. Telling it to start dark makes the switch a no-op. Only
+# libadwaita reads this, and only while starting up; do_startup removes it
+# again so that nothing launched from here inherits it.
+_PRESET_DARK = "ADW_DEBUG_COLOR_SCHEME" not in os.environ
+if _PRESET_DARK:
+    os.environ["ADW_DEBUG_COLOR_SCHEME"] = "prefer-dark"
+
 # Note: GDK_WIN32_FORCE_DCOMP cannot be set from here - importing
 # gi.repository.Gtk above has already loaded GDK. It is set in nekoplay.in,
 # before anything touches gi. See the comment there.
@@ -132,6 +142,8 @@ class CineApplication(Adw.Application):
                 Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION + 1,
             )
         Adw.StyleManager.get_default().props.color_scheme = Adw.ColorScheme.FORCE_DARK
+        if _PRESET_DARK:
+            os.environ.pop("ADW_DEBUG_COLOR_SCHEME", None)
 
         self._create_action("new-window", lambda *a: self.activate(), ["<primary>n"])
         self._create_action("quit", lambda *a: self.quit(), ["<primary>q"])
@@ -182,9 +194,25 @@ class CineApplication(Adw.Application):
         win: CineWindow = cast(CineWindow, self.props.active_window)
         open_new = settings.get_boolean("open-new-windows") or not win
 
+        def queue_loads():
+            for gfile in files:
+                path = gfile.get_path() or gfile.get_uri()
+                if path:
+                    win.mpv.command_async("loadfile", path, "append-play")
+            trace("loadfile issued")
+
+        loads_queued = False
         if open_new:
             win = CineWindow(application=self)
             win.start_page.set_visible(False)
+
+            # Before anything below, all of which can wait: mpv opens the
+            # file while this thread finds the window's size and realizes
+            # it, and holds the load just short of needing the render
+            # context until that exists.
+            if win.can_load_before_present:
+                queue_loads()
+                loads_queued = True
 
             first_video_path = None
             for gfile in files:
@@ -207,21 +235,20 @@ class CineApplication(Adw.Application):
             trace("window presented")
         else:
             win.present()
+            # Everything below is queued rather than waited for: mpv runs
+            # commands in the order they arrive, and this window may still be
+            # busy opening the last file it was handed.
             if is_same_playlist(win.mpv.playlist):
-                win.mpv.write_watch_later_config()
-            win.mpv.stop()
+                win.mpv.command_async("write-watch-later-config")
+            win.mpv.command_async("stop")
 
-        for gfile in files:
-            path = gfile.get_path() or gfile.get_uri()
-            if path:
-                win.mpv.loadfile(path, "append-play")
-
-        trace("loadfile issued")
+        if not loads_queued:
+            queue_loads()
 
         for window in self.get_windows():
             w = cast(CineWindow, window)
             # Pause previous opened windows
-            w.mpv.pause = w != win
+            w.mpv.command_async("set", "pause", "yes" if w != win else "no")
 
         win.hide_ui_timeout()
 

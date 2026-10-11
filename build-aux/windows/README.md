@@ -350,6 +350,82 @@ the app can avoid. Since a second launch now hands its file to the running
 instance and exits (see above), that cost is paid once per session rather
 than once per file.
 
+## From opening a file to its first frame
+
+The trace now runs past "file loaded": "playback restarted" is mpv saying
+playback has begun - first frame shown, audio ready - and it fires again
+after every seek; "frame drawn" is the next frame reaching the screen. What follows was measured on Linux -
+GTK 4.24, libadwaita 1.9, mpv 0.41, Mesa's software GL under Xvfb on four
+cores - against the previous commit with the same trace points, as the
+median of 15 alternating launches, in ms after "app started". The absolute
+numbers are a slow software renderer's; the differences are the point.
+
+| | before | after |
+| --- | --- | --- |
+| 1080p, playback restarted | 424 | 314 |
+| 1080p, next frame drawn | 674 | 509 |
+| 1080p + 1.2 MB external .ass, playback restarted | 560 | 334 |
+| same, next frame drawn | 824 | 537 |
+| thumbnail preview on, next frame drawn | 737 | 540 |
+| a file opened into a running window (mpv's own log, loadfile to first frame) | ~645 | ~440 |
+
+Where it came from:
+
+- **The main thread no longer waits on mpv.** A synchronous property read
+  from the main thread is served by mpv's core thread, and while a file
+  opens that thread can be busy for a long time - while mpv, in turn,
+  needs the main thread to draw the first frame. One read of
+  `playlist-count` from `_sync_can_prev_next` was measured waiting 160 ms
+  of a startup, and playback began the moment it returned. Everything the
+  UI reads now comes from `CineWindow.prop()`, a cache that observers keep
+  current, and the main thread's writes are `command_async`. The few reads
+  that remain (the file's path and title, `user-data/show-icon`) happen on
+  python-mpv's event thread, where waiting costs nothing that is drawn.
+  MPRIS reads the same cache, and computes nothing at all with no D-Bus
+  connection - always the case on Windows, where it used to make three
+  blocking reads for every file.
+- **Each property is observed once.** python-mpv calls
+  `mpv_observe_property` again for every handler, mpv sends one event per
+  observation, and every handler receives every event: with two handlers
+  `time-pos` arrived twice a frame and ran four callbacks. The `MPV`
+  subclass in `window.py` keeps one observation per name, and observes
+  afresh when a handler is added so that it still receives the current
+  value.
+- **The file is opened while the window is realized.** With `vo=libmpv`
+  mpv makes its video output as soon as it knows a file's tracks, and
+  fails - the file plays without video - unless the render context already
+  exists, so `loadfile` used to wait for the whole window. `VideoGLArea`
+  now registers an `on_preloaded` hook (libmpv's hook API, called through
+  ctypes since python-mpv does not bind it) and holds each load there until
+  its render context is up. Reading headers, finding tracks and loading
+  external subtitles overlap with realizing the window; "load held for the
+  render context" in the trace marks it. A window that closes first lets
+  the load go, or mpv could not quit.
+- **The seek-bar thumbnail player starts after the first frame.** It is a
+  second mpv, with its own GL context, demuxer and decoder, and it used to
+  be built and handed the same file at "file loaded" - on the main thread,
+  in front of the first frame. It now opens a second after the first frame,
+  or as soon as the pointer reaches the bar.
+- **libadwaita starts dark.** Forcing the dark style after libadwaita had
+  come up following the system's (light) preference cost 30-55 ms of
+  restyling; `ADW_DEBUG_COLOR_SCHEME=prefer-dark` makes it start dark, and
+  is removed again once startup is done.
+- **mpv's unused scripts are not started.** The OSC, the console, and
+  `select` and `commands` (which only draw through the console) each got a
+  thread and a Lua state at creation. Not starting them takes ~3 ms off
+  creating the player and as much off opening each file.
+- **The probe cache matches relative paths.** `probe.prefetch` keyed its
+  answer by the command line as typed and the window asked with GIO's
+  absolute path, so a relative launch missed and ran ffprobe again, ~80 ms,
+  synchronously, before the window appeared. Keys are normalised now, and a
+  lookup waits for a probe already running instead of starting another.
+
+Two smaller ones keep the main loop quiet during playback: the seek bar is
+only updated when the tenth of a second it shows changes, with at most one
+update queued, and at most one render request is queued however often mpv
+asks. Dragging the seek bar seeks to keyframes while it moves, so each
+position lands at once, and exactly to where it is released.
+
 ## What still costs more than mpv, and why
 
 Even on the GPU path the player costs roughly 50% of one core on that 4K60
