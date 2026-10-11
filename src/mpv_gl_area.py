@@ -289,6 +289,10 @@ class VideoGLArea(BaseGLArea):
         with self._gate_lock:
             self._gate_open = True
             held, self._held = self._held, []
+        # python-mpv frees the handle once the core has shut down, and with
+        # the core gone there is nothing left to release.
+        if not held or self._mpv.core_shutdown:
+            return
         for hook_id in held:
             try:
                 _hook_continue(self._mpv._event_handle, hook_id)

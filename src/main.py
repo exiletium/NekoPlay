@@ -196,9 +196,19 @@ class CineApplication(Adw.Application):
 
         def queue_loads():
             for gfile in files:
-                path = gfile.get_path() or gfile.get_uri()
-                if path:
-                    win.mpv.command_async("loadfile", path, "append-play")
+                # Local paths go over as bytes: a name that is not valid
+                # UTF-8 arrives here with surrogate escapes, and as a str
+                # python-mpv fails to encode it.
+                path = gfile.get_path()
+                target = os.fsencode(path) if path else gfile.get_uri()
+                if not target:
+                    continue
+                try:
+                    win.mpv.command_async("loadfile", target, "append-play")
+                except Exception:
+                    # This can run before the window is shown, and nothing
+                    # here may keep it from being shown.
+                    logger.exception("Could not queue %r", target)
             trace("loadfile issued")
 
         loads_queued = False

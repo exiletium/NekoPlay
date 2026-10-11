@@ -141,6 +141,15 @@ class MPV(mpv.MPV):
             self._event_handle, key, name.encode("utf-8"), mpv.MpvFormat.NODE
         )
 
+    def command_async(self, name, *args, **kwargs):
+        # Async commands go through the handle python-mpv frees as soon as the
+        # core shuts down, and it does not check before using it - so a
+        # callback still queued when a window closes would call into freed
+        # memory. The synchronous calls these replaced raised ShutdownError
+        # there instead; so does this.
+        self.check_core_alive()
+        return super().command_async(name, *args, **kwargs)
+
 
 @Gtk.Template(resource_path="/moe/nyarchlinux/nekoplay/window.ui")
 class CineWindow(Adw.ApplicationWindow):
@@ -263,6 +272,11 @@ class CineWindow(Adw.ApplicationWindow):
         # is nothing for it to do. See _ensure_thumb_preview.
         self._thumb_pending: tuple | None = None
         self._thumb_timeout_id: int = 0
+        # Set when the thumbnail player has a file other than the one playing,
+        # until it is given the new one; the thumbnail is hidden meanwhile.
+        self._thumb_stale: bool = False
+        # Set once the window starts closing; nothing new is started after.
+        self._closing: bool = False
         # The last value mpv reported for each of STATE_PROPS. The main thread
         # reads these through prop() instead of asking mpv: a synchronous read
         # waits for mpv's core thread, which can be busy for a long time while
@@ -1117,6 +1131,8 @@ class CineWindow(Adw.ApplicationWindow):
     def _schedule_thumb_preview(self):
         """Open the thumbnail player a moment after the first frame, once
         playback has settled - or sooner, if the pointer reaches the bar."""
+        if self._closing:
+            return
         if self._thumb_timeout_id:
             GLib.source_remove(self._thumb_timeout_id)
             self._thumb_timeout_id = 0
@@ -1141,7 +1157,7 @@ class CineWindow(Adw.ApplicationWindow):
         if self._thumb_timeout_id:
             GLib.source_remove(self._thumb_timeout_id)
             self._thumb_timeout_id = 0
-        if source is not None and self._wants_thumb_preview():
+        if source is not None and not self._closing and self._wants_thumb_preview():
             self.setup_thumb_preview(source)
 
     def setup_thumb_preview(self, source=None):
@@ -1150,6 +1166,8 @@ class CineWindow(Adw.ApplicationWindow):
         *source* is what _thumb_source() captured; without it (the setting
         was just switched on) it is read here.
         """
+        if self._closing:
+            return
         if source is None:
             source = self._thumb_source()
             if source is None:
@@ -1178,6 +1196,7 @@ class CineWindow(Adw.ApplicationWindow):
         self.thumb_area.set_size_request(width, height)
         a = self.thumb_area
         a.stop() if self._is_audio else a.load_file(path)
+        self._thumb_stale = False
 
     def _on_progress_enter(self, *args):
         self._ensure_thumb_preview()
@@ -1208,7 +1227,13 @@ class CineWindow(Adw.ApplicationWindow):
             self._hide_time_tooltip()
             return
 
-        show_thumb = self.thumb_area is not None and not self._is_audio
+        # The pointer may have been on the bar since before this file
+        # started, with no enter event to hand the thumbnail player its file.
+        if self._thumb_pending is not None:
+            self._ensure_thumb_preview()
+        show_thumb = (
+            self.thumb_area is not None and not self._is_audio and not self._thumb_stale
+        )
 
         if not self.prev_reveal:
             self.tooltip_thumb_revealer.set_reveal_child(show_thumb)
@@ -1304,6 +1329,8 @@ class CineWindow(Adw.ApplicationWindow):
 
     def _flush_progress(self):
         self._prog_update_queued = False
+        if self._dragging_progress:
+            return  # the knob drives the clock until it is let go
         self._update_progress(float(self.prop("time-pos", 0)))
 
     def _update_progress(self, curr_time, update_bar=True):
@@ -1508,7 +1535,12 @@ class CineWindow(Adw.ApplicationWindow):
 
     def _on_progress_adjusted(self, adjustment):
         value = adjustment.props.value
-        if self._dragging_progress:
+        # GtkRange's fine-tune mode (a long press, or Shift+click, on the
+        # knob) is for picking an exact moment, so it always seeks exactly.
+        fine_tune = self._prog_fine_tune or self.video_progress_scale.has_css_class(
+            "fine-tune"
+        )
+        if self._dragging_progress and not fine_tune:
             # Keyframes only while the slider moves: each lands at once,
             # where an exact seek would decode its way to a frame the next
             # motion has already made stale. Release seeks exactly.
@@ -1516,6 +1548,10 @@ class CineWindow(Adw.ApplicationWindow):
             self.mpv.command_async("seek", value, "absolute+keyframes")
         else:
             self.mpv.command_async("seek", value, "absolute")
+        if self._dragging_progress:
+            # The clock shows where the knob is, not the keyframe the video
+            # stopped on.
+            self._update_progress(value, update_bar=False)
 
     @Gtk.Template.Callback()
     def _on_shuffle_toggled(self, button):
@@ -1977,6 +2013,14 @@ class CineWindow(Adw.ApplicationWindow):
             timeout_add_once(350, self.revealer_icon_indicator.set_reveal_child, False)
 
     def do_close_request(self) -> bool:
+        # Nothing queued for this window may start anything new: the
+        # thumbnail player in particular would be a fresh mpv on a window
+        # that is gone, with nothing left to shut it down.
+        self._closing = True
+        self._thumb_pending = None
+        if self._thumb_timeout_id:
+            GLib.source_remove(self._thumb_timeout_id)
+            self._thumb_timeout_id = 0
         # A render still going is for a playback that is about to end.
         self.video2x.cancel_all()
         # A load held for a render context that will now never exist would
@@ -2042,11 +2086,14 @@ class CineWindow(Adw.ApplicationWindow):
                 self._on_ab_loop_btn_toggled(None)
 
                 # The thumbnail player is given this file once its first
-                # frame is up; see on_playback_restart.
+                # frame is up (see on_playback_restart); until then it still
+                # holds the last one, so it stays out of sight.
                 if self.thumb_area and not self._wants_thumb_preview():
                     self.thumb_area.unrealize()
                     self.thumb_area.unmap()
                     self.thumb_area = None
+                elif self.thumb_area:
+                    self._thumb_stale = True
 
                 self._set_time_tooltip()
 
@@ -2246,10 +2293,15 @@ class CineWindow(Adw.ApplicationWindow):
                 self._prog_update_queued = True
                 idle_add_once(self._flush_progress)
 
+        def emit_seeked(pos):
+            # MPRIS describes the active window, whichever one seeked.
+            if self.app.props.active_window is self:
+                self._mpris.emit_seeked(pos)
+
         @self.mpv.property_observer("seeking")
         def on_seeking_change(_name, seeking):
             if not seeking and self._mpris.connected:
-                idle_add_once(self._mpris.emit_seeked, self.mpv.time_pos)
+                idle_add_once(emit_seeked, self.mpv.time_pos)
 
         @self.mpv.property_observer("duration")
         def on_duration_change(_name, value):
@@ -2386,6 +2438,12 @@ class CineWindow(Adw.ApplicationWindow):
             idle_add_once(sync_idle_active, is_idle)
 
         def sync_title(title, filename):
+            # python-mpv hands over a name that is not valid UTF-8 as bytes,
+            # which GTK will not take.
+            if isinstance(title, bytes):
+                title = title.decode("utf-8", "replace")
+            if isinstance(filename, bytes):
+                filename = filename.decode("utf-8", "replace")
             try:
                 if title == filename:
                     title_no_ext = os.path.splitext(title)[0]

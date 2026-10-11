@@ -142,10 +142,16 @@ class MPRIS:
             GLib.Variant("(sa{sv}as)", (MEDIAPLAYER2_PLAYER, changed_props, [])),
         )
 
-    def update_props(self, *args):
-        """Notifies D-Bus that properties have changed."""
+    def update_props(self, *args, idle=None):
+        """Notifies D-Bus that properties have changed.
+
+        *idle* overrides what the window last heard from mpv, for a caller
+        that has just changed it and cannot wait for mpv to report back.
+        """
         if not self._con:
             return
+        if idle is None:
+            idle = self._prop("idle-active", True)
 
         self._emit_props_changed(
             {
@@ -164,7 +170,7 @@ class MPRIS:
                     "PlaybackStatus": GLib.Variant("s", status),
                     "LoopStatus": GLib.Variant("s", loop),
                     "Metadata": self._get_metadata_variant()
-                    if not self._prop("idle-active", True)
+                    if not idle
                     else GLib.Variant("a{sv}", {}),
                     "CanPlay": GLib.Variant("b", True),
                     "CanPause": GLib.Variant("b", True),
@@ -195,8 +201,11 @@ class MPRIS:
         controls ask for Position and Metadata whenever they like.
         """
         win = self._app.props.active_window
-        prop = getattr(win, "prop", None)
-        return prop(name, default) if prop else default
+        # A new window is already the active one while it is being built,
+        # before it has a player or any state to go with it.
+        if getattr(win, "mpv", None) is None:
+            return default
+        return win.prop(name, default)
 
     @property
     def _can_go_prev(self):
@@ -322,17 +331,21 @@ class MPRIS:
                     win.on_next_clicked()  # type: ignore
             elif method == "Stop":
                 p.command_async("stop")
-                self.update_props()
+                # mpv is idle the moment it runs that, but the window only
+                # hears of it later - and nothing announces it again then.
+                self.update_props(idle=True)
             elif method == "Seek":
                 offset_usec = params.get_child_value(0).get_int64()
                 target = self._prop("time-pos", 0) + (offset_usec / 1_000_000.0)
-                p.command_async("seek", target, "absolute")
-                self.emit_seeked(target)
+                # Setting time-pos rather than a "seek ... absolute", which
+                # would read a negative target as counting from the end.
+                p.command_async("set", "time-pos", target)
+                self.emit_seeked(max(0.0, target))
             elif method == "SetPosition":
                 pos_usec = params.get_child_value(1).get_int64()
                 target = pos_usec / 1_000_000.0
-                p.command_async("seek", target, "absolute")
-                self.emit_seeked(target)
+                p.command_async("set", "time-pos", target)
+                self.emit_seeked(max(0.0, target))
             elif method == "Raise":
                 win.present()
             elif method == "Quit":
