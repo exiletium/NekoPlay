@@ -21,6 +21,7 @@ import bisect
 import logging
 import os
 import shlex
+import threading
 from gettext import gettext as _
 from typing import cast
 from urllib.parse import urlparse
@@ -141,14 +142,28 @@ class MPV(mpv.MPV):
             self._event_handle, key, name.encode("utf-8"), mpv.MpvFormat.NODE
         )
 
+    def __init__(self, *args, **kwargs):
+        self._alive_lock = threading.Lock()
+        self._dead = False
+        super().__init__(*args, **kwargs)
+
+        # python-mpv runs event callbacks before it frees the handle async
+        # commands go through, so once this has run no command can start, and
+        # while a command is under way this waits for it.
+        @self.event_callback("shutdown")
+        def on_shutdown(_event):
+            with self._alive_lock:
+                self._dead = True
+
     def command_async(self, name, *args, **kwargs):
-        # Async commands go through the handle python-mpv frees as soon as the
-        # core shuts down, and it does not check before using it - so a
-        # callback still queued when a window closes would call into freed
-        # memory. The synchronous calls these replaced raised ShutdownError
-        # there instead; so does this.
-        self.check_core_alive()
-        return super().command_async(name, *args, **kwargs)
+        # python-mpv frees that handle as soon as the core shuts down and does
+        # not check before using it, so a callback still queued when a window
+        # closes would call into freed memory. The synchronous calls these
+        # replaced raised ShutdownError there instead; so does this.
+        with self._alive_lock:
+            if self._dead:
+                raise mpv.ShutdownError("libmpv core has been shutdown")
+            return super().command_async(name, *args, **kwargs)
 
 
 @Gtk.Template(resource_path="/moe/nyarchlinux/nekoplay/window.ui")
@@ -255,6 +270,7 @@ class CineWindow(Adw.ApplicationWindow):
         self.is_local_path: bool = True
         self._prog_fine_tune: bool = False
         self._dragging_progress: bool = False
+        self._skip_reset_id: int = 0
         self._drag_seek_target: float | None = None
         self._error_count: int = 0
         self._pressed_combos: set[str] = set()
@@ -1195,8 +1211,16 @@ class CineWindow(Adw.ApplicationWindow):
         self._thumb_w = width
         self.thumb_area.set_size_request(width, height)
         a = self.thumb_area
-        a.stop() if self._is_audio else a.load_file(path)
-        self._thumb_stale = False
+        if self._is_audio:
+            a.stop()
+            self._thumb_stale = False
+        elif a.load_file(path):
+            self._thumb_stale = False
+        # The pointer may be resting on the bar with the thumbnail hidden.
+        if self.prev_reveal:
+            self.tooltip_thumb_revealer.set_reveal_child(
+                not self._is_audio and not self._thumb_stale
+            )
 
     def _on_progress_enter(self, *args):
         self._ensure_thumb_preview()
@@ -1239,6 +1263,8 @@ class CineWindow(Adw.ApplicationWindow):
             self.tooltip_thumb_revealer.set_reveal_child(show_thumb)
             self.tooltip_label_revealer.set_reveal_child(True)
             self.prev_reveal = True
+        elif self.tooltip_thumb_revealer.get_reveal_child() != show_thumb:
+            self.tooltip_thumb_revealer.set_reveal_child(show_thumb)
 
         if self.prog_width <= 0:
             return
@@ -1506,10 +1532,16 @@ class CineWindow(Adw.ApplicationWindow):
 
     @Gtk.Template.Callback()
     def _cycle_pause(self, *args):
+        # Asked for by the user, like every other input that resets this:
+        # its change must show.
+        self.skip_pause_obs_count = 0
         self.mpv.command_async("cycle", "pause")
 
     def _on_progress_pressed(self, *args):
         self._dragging_progress = True
+        if self._skip_reset_id:
+            GLib.source_remove(self._skip_reset_id)
+            self._skip_reset_id = 0
         try:
             self._playing_on_press = not self.prop("pause")
             if self._playing_on_press:
@@ -1529,6 +1561,15 @@ class CineWindow(Adw.ApplicationWindow):
                 self.skip_pause_obs_count += 1
                 self._playing_on_press = False
                 self.mpv.command_async("set", "pause", "no")
+
+                # mpv can report a pause and a resume this close together
+                # as one change, or none, and a count left over would hide
+                # the next real one - mpv pausing at the end of the file.
+                def reset():
+                    self._skip_reset_id = 0
+                    self.skip_pause_obs_count = 0
+
+                self._skip_reset_id = timeout_add_once(1000, reset)
         except Exception:
             logger.exception("_on_progress_released failed")
             self.skip_pause_obs_count = 0
@@ -1547,11 +1588,13 @@ class CineWindow(Adw.ApplicationWindow):
             self._drag_seek_target = value
             self.mpv.command_async("seek", value, "absolute+keyframes")
         else:
+            # Exact already, so there is nothing left for a release to fix.
+            self._drag_seek_target = None
             self.mpv.command_async("seek", value, "absolute")
-        if self._dragging_progress:
-            # The clock shows where the knob is, not the keyframe the video
-            # stopped on.
-            self._update_progress(value, update_bar=False)
+        # The clock shows where the knob is: while dragging, not the keyframe
+        # the video stopped on, and for a click, the time it seeked to, which
+        # a paused video would otherwise never report back.
+        self._update_progress(value, update_bar=False)
 
     @Gtk.Template.Callback()
     def _on_shuffle_toggled(self, button):
@@ -2087,13 +2130,11 @@ class CineWindow(Adw.ApplicationWindow):
 
                 # The thumbnail player is given this file once its first
                 # frame is up (see on_playback_restart); until then it still
-                # holds the last one, so it stays out of sight.
+                # holds the last one, and _thumb_stale keeps it out of sight.
                 if self.thumb_area and not self._wants_thumb_preview():
                     self.thumb_area.unrealize()
                     self.thumb_area.unmap()
                     self.thumb_area = None
-                elif self.thumb_area:
-                    self._thumb_stale = True
 
                 self._set_time_tooltip()
 
@@ -2111,6 +2152,9 @@ class CineWindow(Adw.ApplicationWindow):
             trace("file loaded")
             first_restart = True
             self._thumb_pending = None
+            # Set here, before playback-restart can hand the thumbnail
+            # player this file, so the two cannot arrive in the wrong order.
+            self._thumb_stale = True
             idle_add_once(on_f_loaded, self.mpv.path)
             timeout_add_seconds_once(5, setattr, self, "_error_count", 0)
 
@@ -2522,9 +2566,19 @@ class CineWindow(Adw.ApplicationWindow):
             except mpv.ShutdownError:
                 pass
 
+        def close_after_quit():
+            # A dialog open on the window takes its close request for
+            # itself, which would leave the window up with no player.
+            for _i in range(8):
+                dialog = self.get_visible_dialog()
+                if dialog is None:
+                    break
+                dialog.force_close()
+            self.close()
+
         @self.mpv.event_callback("shutdown")
         def on_quit(_event):
-            idle_add_once(self.close)
+            idle_add_once(close_after_quit)
 
     @property
     def can_load_before_present(self) -> bool:

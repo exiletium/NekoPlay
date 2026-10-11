@@ -192,7 +192,10 @@ class CineApplication(Adw.Application):
 
     def do_open(self, files, n_files, hint):
         win: CineWindow = cast(CineWindow, self.props.active_window)
-        open_new = settings.get_boolean("open-new-windows") or not win
+        # A window whose player has shut down is only waiting to close.
+        open_new = (
+            settings.get_boolean("open-new-windows") or not win or win.mpv.core_shutdown
+        )
 
         def queue_loads():
             for gfile in files:
@@ -257,6 +260,8 @@ class CineApplication(Adw.Application):
 
         for window in self.get_windows():
             w = cast(CineWindow, window)
+            if w.mpv.core_shutdown:
+                continue
             # Pause previous opened windows
             w.mpv.command_async("set", "pause", "yes" if w != win else "no")
 

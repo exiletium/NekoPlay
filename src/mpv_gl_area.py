@@ -18,6 +18,7 @@
 
 import ctypes
 import logging
+import os
 import threading
 
 import gi
@@ -197,12 +198,17 @@ class ThumbPreviewGLArea(BaseGLArea):
             self._mpv = None
             self._ctx = None
 
-    def load_file(self, path):
+    def load_file(self, path) -> bool:
         try:
             assert self._mpv is not None
-            self._mpv.loadfile(path, "replace")
+            # mpv hands back a name that is not valid UTF-8 as bytes, which
+            # python-mpv's loadfile cannot take; bytes go through untouched.
+            target = path if isinstance(path, bytes) else os.fsencode(path)
+            self._mpv.command("loadfile", target, "replace")
+            return True
         except Exception:
             logger.exception("ThumbPreviewGLArea load_file failed")
+            return False
 
     def seek(self, time):
         self._time = time
