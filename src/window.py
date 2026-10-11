@@ -288,9 +288,15 @@ class CineWindow(Adw.ApplicationWindow):
         # is nothing for it to do. See _ensure_thumb_preview.
         self._thumb_pending: tuple | None = None
         self._thumb_timeout_id: int = 0
-        # Set when the thumbnail player has a file other than the one playing,
-        # until it is given the new one; the thumbnail is hidden meanwhile.
-        self._thumb_stale: bool = False
+        # Files loaded so far, counted on mpv's event thread, and the count
+        # the thumbnail player last caught up with: it shows the playing file
+        # only while the two agree. A count rather than a flag, so that a
+        # hand-off finishing after the next file has started cannot pass
+        # for current.
+        self._load_gen: int = 0
+        self._thumb_gen: int = -1
+        # Where the pointer is on the seek bar, or None while it is off it.
+        self._bar_pointer: tuple | None = None
         # Set once the window starts closing; nothing new is started after.
         self._closing: bool = False
         # The last value mpv reported for each of STATE_PROPS. The main thread
@@ -611,7 +617,7 @@ class CineWindow(Adw.ApplicationWindow):
         progress_hover = Gtk.EventControllerMotion()
         progress_hover.connect("enter", self._on_progress_enter)
         progress_hover.connect("motion", self._on_progress_motion)
-        progress_hover.connect("leave", self._hide_time_tooltip)
+        progress_hover.connect("leave", self._on_progress_leave)
         self.video_progress_scale.add_controller(progress_hover)
 
         prog_mid_click = Gtk.GestureClick(button=2)
@@ -1167,20 +1173,31 @@ class CineWindow(Adw.ApplicationWindow):
         # busy every frame would starve an idle source indefinitely.
         self._thumb_timeout_id = GLib.timeout_add(THUMB_PREVIEW_DELAY_MS, on_timeout)
 
-    def _ensure_thumb_preview(self):
-        """Give the thumbnail player the current file, if it is still waiting."""
-        source, self._thumb_pending = self._thumb_pending, None
+    def _thumb_current(self) -> bool:
+        """Whether the thumbnail player holds the file that is playing."""
+        return self._thumb_gen == self._load_gen
+
+    def _ensure_thumb_preview(self) -> bool:
+        """Give the thumbnail player the current file, if it is still
+        waiting for it. True if it was given."""
+        pending, self._thumb_pending = self._thumb_pending, None
         if self._thumb_timeout_id:
             GLib.source_remove(self._thumb_timeout_id)
             self._thumb_timeout_id = 0
-        if source is not None and not self._closing and self._wants_thumb_preview():
-            self.setup_thumb_preview(source)
+        if pending is None or self._closing or not self._wants_thumb_preview():
+            return False
+        gen, source = pending
+        if gen != self._load_gen:
+            return False  # for a file that has been replaced since
+        self.setup_thumb_preview(source, gen)
+        return True
 
-    def setup_thumb_preview(self, source=None):
+    def setup_thumb_preview(self, source=None, gen=None):
         """Size the seek-bar thumbnail and open the current file in it.
 
-        *source* is what _thumb_source() captured; without it (the setting
-        was just switched on) it is read here.
+        *source* is what _thumb_source() captured, and *gen* the load it
+        belongs to; without them (the setting was just switched on) they are
+        read here.
         """
         if self._closing:
             return
@@ -1188,6 +1205,8 @@ class CineWindow(Adw.ApplicationWindow):
             source = self._thumb_source()
             if source is None:
                 return
+        if gen is None:
+            gen = self._load_gen
         path, hwdec, width, height = source
 
         if not self.thumb_area:
@@ -1213,18 +1232,37 @@ class CineWindow(Adw.ApplicationWindow):
         a = self.thumb_area
         if self._is_audio:
             a.stop()
-            self._thumb_stale = False
-        elif a.load_file(path):
-            self._thumb_stale = False
-        # The pointer may be resting on the bar with the thumbnail hidden.
-        if self.prev_reveal:
-            self.tooltip_thumb_revealer.set_reveal_child(
-                not self._is_audio and not self._thumb_stale
-            )
+            self._thumb_gen = gen
+        # Opened where the pointer rests, if it does: a seek sent to a file
+        # that is still opening would be refused.
+        elif a.load_file(path, self._resting_hover_time()):
+            self._thumb_gen = gen
 
-    def _on_progress_enter(self, *args):
-        self._ensure_thumb_preview()
+        # A pointer resting on the bar gets the thumbnail where it is.
+        if self._bar_pointer is not None:
+            x, y = self._bar_pointer
+            self._set_time_tooltip()
+            self._on_progress_motion(None, x, y, seek_thumb=False)
+
+    def _resting_hover_time(self) -> float | None:
+        """The time under a pointer resting on the seek bar, if one is."""
+        if self._bar_pointer is None:
+            return None
+        width = self.video_progress_scale.get_width()
+        duration = float(self.prop("duration", 0))
+        if width <= 0 or duration <= 0:
+            return None
+        return max(0.0, min(1.0, self._bar_pointer[0] / width)) * duration
+
+    def _on_progress_enter(self, _controller=None, x=None, y=None):
+        if x is not None:
+            self._bar_pointer = (x, y)
         self._set_time_tooltip()
+        self._ensure_thumb_preview()
+
+    def _on_progress_leave(self, *args):
+        self._bar_pointer = None
+        self._hide_time_tooltip()
 
     def _hide_time_tooltip(self, *args):
         self.prev_reveal = False
@@ -1242,22 +1280,23 @@ class CineWindow(Adw.ApplicationWindow):
         x_pos = max(0, min(x - (tooltip_w / 2) + 23, self.width - tooltip_w))
         layer.move(revealer, x_pos, 0)
 
-    def _on_progress_motion(self, _controller, x, y):
+    def _on_progress_motion(self, _controller, x, y, seek_thumb=True):
         if (x, y) == self._prev_prog_motion_xy:
             return
         self._prev_prog_motion_xy = (x, y)
+        self._bar_pointer = (x, y)
 
         if self._prog_fine_tune:
             self._hide_time_tooltip()
             return
 
         # The pointer may have been on the bar since before this file
-        # started, with no enter event to hand the thumbnail player its file.
-        if self._thumb_pending is not None:
-            self._ensure_thumb_preview()
-        show_thumb = (
-            self.thumb_area is not None and not self._is_audio and not self._thumb_stale
-        )
+        # started, with no enter event to hand the thumbnail player its file;
+        # handing it over redraws the tooltip here.
+        if self._thumb_pending is not None and self._ensure_thumb_preview():
+            return
+        current = self._thumb_current()
+        show_thumb = self.thumb_area is not None and not self._is_audio and current
 
         if not self.prev_reveal:
             self.tooltip_thumb_revealer.set_reveal_child(show_thumb)
@@ -1297,7 +1336,8 @@ class CineWindow(Adw.ApplicationWindow):
             self.tooltip_thumb_revealer, self.tooltip_thumb_layer, x, self._thumb_w + 12
         )
 
-        idle_add_once(self.thumb_area.seek, self._hover_time)
+        if seek_thumb and current:
+            idle_add_once(self.thumb_area.seek, self._hover_time)
 
     def _go_to_chapter_start(self, *args):
         if self._curr_chapter_time is not None:
@@ -1537,7 +1577,15 @@ class CineWindow(Adw.ApplicationWindow):
         self.skip_pause_obs_count = 0
         self.mpv.command_async("cycle", "pause")
 
-    def _on_progress_pressed(self, *args):
+    def _on_progress_pressed(self, gesture=None, *args):
+        # GtkRange's drag gesture answers every button, but only the primary
+        # one moves the knob; a middle click is the jump to a chapter start.
+        # (Touch reports no button at all.)
+        if gesture is not None and gesture.get_current_button() not in (
+            0,
+            Gdk.BUTTON_PRIMARY,
+        ):
+            return
         self._dragging_progress = True
         if self._skip_reset_id:
             GLib.source_remove(self._skip_reset_id)
@@ -1552,6 +1600,8 @@ class CineWindow(Adw.ApplicationWindow):
             self.skip_pause_obs_count = 0
 
     def _on_progress_released(self, *args):
+        if not self._dragging_progress:
+            return  # a press that was not a drag of the knob
         self._dragging_progress = False
         target, self._drag_seek_target = self._drag_seek_target, None
         if target is not None:
@@ -2130,11 +2180,13 @@ class CineWindow(Adw.ApplicationWindow):
 
                 # The thumbnail player is given this file once its first
                 # frame is up (see on_playback_restart); until then it still
-                # holds the last one, and _thumb_stale keeps it out of sight.
+                # holds the last one, which must not stay on screen.
                 if self.thumb_area and not self._wants_thumb_preview():
                     self.thumb_area.unrealize()
                     self.thumb_area.unmap()
                     self.thumb_area = None
+                elif self.thumb_area and not self._thumb_current():
+                    self.tooltip_thumb_revealer.set_reveal_child(False)
 
                 self._set_time_tooltip()
 
@@ -2152,9 +2204,7 @@ class CineWindow(Adw.ApplicationWindow):
             trace("file loaded")
             first_restart = True
             self._thumb_pending = None
-            # Set here, before playback-restart can hand the thumbnail
-            # player this file, so the two cannot arrive in the wrong order.
-            self._thumb_stale = True
+            self._load_gen += 1
             idle_add_once(on_f_loaded, self.mpv.path)
             timeout_add_seconds_once(5, setattr, self, "_error_count", 0)
 
@@ -2169,7 +2219,8 @@ class CineWindow(Adw.ApplicationWindow):
                 first_restart = False
                 # Read here rather than on the main thread, where each of
                 # these reads would wait for mpv.
-                self._thumb_pending = self._thumb_source()
+                source = self._thumb_source()
+                self._thumb_pending = (self._load_gen, source) if source else None
                 idle_add_once(self._schedule_thumb_preview)
 
         @self.mpv.event_callback("end-file")
