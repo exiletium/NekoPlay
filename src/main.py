@@ -32,7 +32,7 @@ gi.require_version("GLib", "2.0")
 gi.require_version("Gtk", "4.0")
 from gi.repository import Adw, Gdk, Gio, GLib, Gtk
 
-from . import probe
+from . import autostart, probe
 from .mpris import MPRIS
 from .platform_compat import IS_WINDOWS, round_new_windows, trace
 from .preferences import Preferences, settings
@@ -78,7 +78,14 @@ SPARE_PREPARE_DELAY_MS = 50
 # that the spare window catches up on when it is taken
 # (CineWindow.refresh_from_settings). Any other change rebuilds it.
 SPARE_REFRESHED_KEYS = frozenset(
-    ("volume", "subtitle-scale", "loop-state", "show-remaining", "is-maximized")
+    (
+        "volume",
+        "subtitle-scale",
+        "loop-state",
+        "show-remaining",
+        "is-maximized",
+        "autostart-requested",
+    )
 )
 
 
@@ -179,12 +186,19 @@ class CineApplication(Adw.Application):
 
         settings.connect("changed", self._on_setting_changed)
         self._sync_background()
+        # Off the startup path: it touches the disk, or the session bus.
+        GLib.timeout_add(SPARE_WINDOW_DELAY_MS, self._sync_autostart)
 
         trace("app started")
+
+    def _sync_autostart(self):
+        autostart.sync(settings.get_boolean("run-in-background"), settings)
+        return GLib.SOURCE_REMOVE
 
     def _on_setting_changed(self, _settings, key):
         if key == "run-in-background":
             self._sync_background()
+            self._sync_autostart()
         elif key not in SPARE_REFRESHED_KEYS:
             # The spare window was built with the old value.
             self._drop_spare()

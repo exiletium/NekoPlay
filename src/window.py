@@ -341,6 +341,11 @@ class CineWindow(Adw.ApplicationWindow):
             load_console=False,
             load_select=False,
             load_commands=False,
+            # The first frame of every file waits for mpv to build its dither
+            # matrix, and the default 64x64 one takes 15-20 ms of CPU to make.
+            # 32x32 is made in about one, and dithering by one step of 8 bits
+            # is not something a larger tile makes visible.
+            dither_size_fruit=5,
             audio_display="embedded-first",
             audio_file_auto="fuzzy",
             sub_auto="fuzzy",

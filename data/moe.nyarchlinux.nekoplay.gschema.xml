@@ -57,7 +57,11 @@
 		<key name="run-in-background" type="b">
 			<default>true</default>
 			<summary>Keep running after the last window closes</summary>
-			<description>When started by the desktop, stay in the background with a window prepared, so that opening a video shows it at once. Quitting from the menu or with Ctrl+Q still exits.</description>
+			<description>Start with the session and, when started by the desktop, stay in the background with a window prepared, so that opening a video shows it at once. Quitting from the menu or with Ctrl+Q still exits.</description>
+		</key>
+		<key name="autostart-requested" type="b">
+			<default>false</default>
+			<summary>Whether the Background portal was last asked to start NekoPlay with the session</summary>
 		</key>
 		<key name="is-maximized" type="b">
 			<default>false</default>
