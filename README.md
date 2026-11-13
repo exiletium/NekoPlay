@@ -36,6 +36,12 @@ NekoPlay is a fork of [Cine](https://github.com/diegopvlk/Cine) but with a few e
 >   a later pass that keeps the UI thread from ever waiting on mpv, opens
 >   the file while the window is still being built, and starts the
 >   thumbnail player after the first frame rather than before it.
+> - **Instant opening on Linux**: started by the desktop (D-Bus activation),
+>   NekoPlay stays in the background after its last window closes, with a
+>   window already built for the next video. That window is on screen
+>   ~20 ms after a launch from the desktop, ~35 ms after
+>   `nekoplay --new-window <file>` in a terminal, which hands its files over
+>   before loading GTK. "Run in Background" in Preferences turns it off.
 >
 > The details, and the measurements behind each claim, are in
 > [`build-aux/windows/README.md`](build-aux/windows/README.md).

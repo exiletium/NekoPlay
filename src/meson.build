@@ -92,6 +92,7 @@ cine_sources = [
   'playlist.py',
   'preferences.py',
   'probe.py',
+  'remote.py',
   'save_session.py',
   'shortcuts.py',
   'utils.py',

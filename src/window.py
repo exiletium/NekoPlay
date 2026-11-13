@@ -116,6 +116,10 @@ STATE_PROPS = (
 # main one put all of that in front of the first frame.
 THUMB_PREVIEW_DELAY_MS = 1000
 
+# How long a window that sizes itself from mpv (present_when_sized) waits to
+# be told the size before it is shown anyway. A local file takes a few ms.
+SIZE_WAIT_MS = 100
+
 
 class MPV(mpv.MPV):
     """python-mpv, observing each property once however many handlers it has.
@@ -238,6 +242,9 @@ class CineWindow(Adw.ApplicationWindow):
         self.can_go_prev: bool = False
         self.can_go_next: bool = False
         self._loop_mode: str = "off"
+        # Set by prepare(); see present_when_sized.
+        self._sized_by_mpv = False
+        self._size_waiter = None
         self._chapters: list = []
         self._curr_chapter_time = None
         self._actions: dict[str, Gio.SimpleAction] = {}
@@ -445,7 +452,7 @@ class CineWindow(Adw.ApplicationWindow):
         sync_mpv_with_settings(self)
 
         if settings.get_boolean("save-session") and is_activate:
-            restore_last_playlist(self, self.app, self.mpv)
+            self.restore_session()
 
         # Needs the native window, which only exists once realized.
         self.connect("realize", lambda w: round_window_corners(w))
@@ -457,6 +464,96 @@ class CineWindow(Adw.ApplicationWindow):
             # step left in startup, so it gets its own marks.
             self.connect("realize", lambda w: trace("window realized"))
             self.connect("map", lambda w: trace("window mapped"))
+
+    def restore_session(self):
+        """Load the playlist saved from the last session."""
+        restore_last_playlist(self, self.app, self.mpv)
+
+    def prepare(self):
+        """Do now what showing this window would otherwise do first.
+
+        For a window built ahead of time and kept hidden: realizing makes
+        the native surface, the GL context and mpv's render context, which
+        is most of the work between asking for a window and seeing it.
+        """
+        self._video_area.realize()
+        self._sized_by_mpv = True
+
+        def report_size():
+            # On mpv's event thread, while it holds the file at on_preloaded:
+            # tracks known, no video output yet, and reads answered at once.
+            # Later the core can be waiting to draw into this window, which
+            # is not on screen until this answer comes.
+            show, self._size_waiter = self._size_waiter, None
+            if show is None:
+                return
+            size = None
+            try:
+                tracks = self.mpv._get_property("track-list") or []
+                # Like ffprobe's v:0, but not a cover picture.
+                track = next(
+                    t for t in tracks if t.get("type") == "video" and not t.get("albumart")
+                )
+                # The size ffprobe would give, from what mpv's demuxer read.
+                width, height = int(track["demux-w"]), int(track["demux-h"])
+                rotated = int(track.get("demux-rotation") or 0) % 180 == 90
+                size = (height, width) if rotated else (width, height)
+            except Exception:
+                pass  # no video: shown at its default size
+            GLib.idle_add(show, size, priority=GLib.PRIORITY_HIGH)
+
+        self._video_area.on_preloaded = report_size
+
+    @property
+    def can_size_from_mpv(self) -> bool:
+        """Whether present_when_sized can be used: the window is prepared,
+        so mpv opens what it is given at once."""
+        return self._sized_by_mpv and self._video_area.get_realized()
+
+    def present_when_sized(self):
+        """Show the window as soon as mpv knows the size of the first file
+        it is about to be given, or after SIZE_WAIT_MS if it does not.
+        Call before handing it the files.
+
+        Sized this way rather than by ffprobe (probe.py): the launch that
+        would have started that probe early never got this far, it handed
+        its files over, and run here it would hold up the main loop for
+        longer than mpv takes to open the file.
+        """
+        shown = False
+
+        def show(size=None):
+            nonlocal shown
+            if not shown:
+                shown = True
+                self._size_waiter = None
+                if size:
+                    self.set_window_size(*size)
+                self.present()
+                trace("window presented")
+            return GLib.SOURCE_REMOVE
+
+        self._size_waiter = show
+        GLib.timeout_add(SIZE_WAIT_MS, show)
+
+    def refresh_from_settings(self):
+        """Catch a window built ahead of time up with the settings that
+        change in everyday use: volume, looping and the like are saved as
+        they change, and this window read them when it was built."""
+        loop = settings.get_string("loop-state")
+        for name, value in (
+            ("volume", settings.get_int("volume")),
+            ("sub-scale", settings.get_double("subtitle-scale")),
+            ("loop-playlist", "inf" if loop == "playlist" else "no"),
+            ("loop-file", "inf" if loop == "file" else "no"),
+        ):
+            self.mpv.command_async("set", name, str(value))
+        self._show_remaining = settings.get_boolean("show-remaining")
+        self._set_time_margin()
+        if settings.get_boolean("is-maximized"):
+            self.maximize()
+        else:
+            self.unmaximize()
 
     def _setup_actions(self):
         self._create_action("clear-and-add", self._on_clear_and_add)

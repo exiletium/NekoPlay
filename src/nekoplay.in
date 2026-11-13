@@ -21,9 +21,6 @@
 
 import os
 import sys
-import signal
-import locale
-import gettext
 import time
 
 # Startup milestones reached before src/ is on sys.path, flushed once
@@ -57,6 +54,21 @@ if os.name == 'nt':
         os.add_dll_directory(bindir)
 
 sys.path.insert(1, pkgdatadir)
+
+if os.name != 'nt' and __name__ == '__main__':
+    # A launch while NekoPlay is running only hands its files over. On
+    # Linux GApplication would do that over D-Bus anyway, but only once GTK
+    # and the whole app were loaded: ~200 ms before the running instance
+    # heard of it, against a few ms here, before even the imports below.
+    from cine.remote import forward_to_running_instance
+
+    _status = forward_to_running_instance('moe.nyarchlinux.nekoplay', sys.argv[1:])
+    if _status is not None:
+        sys.exit(_status)
+
+import signal  # noqa: E402
+import locale  # noqa: E402
+import gettext  # noqa: E402
 
 from cine.platform_compat import TRACE, trace, _T0  # noqa: E402
 

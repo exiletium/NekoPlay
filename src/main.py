@@ -68,6 +68,20 @@ if _PRESET_DARK:
 # before anything touches gi. See the comment there.
 
 
+# How long after startup, or after the last one was taken, to build the
+# next window ahead of time: late enough to stay out of the way of the
+# window just opened, which is still loading its file.
+SPARE_WINDOW_DELAY_MS = 3000
+# And how much later to realize it, in a main loop turn of its own.
+SPARE_PREPARE_DELAY_MS = 50
+# Settings a window reads when it is built that change in everyday use, and
+# that the spare window catches up on when it is taken
+# (CineWindow.refresh_from_settings). Any other change rebuilds it.
+SPARE_REFRESHED_KEYS = frozenset(
+    ("volume", "subtitle-scale", "loop-state", "show-remaining", "is-maximized")
+)
+
+
 class CineApplication(Adw.Application):
     """The main application singleton class."""
 
@@ -80,6 +94,14 @@ class CineApplication(Adw.Application):
         # The named pipe claimed in nekoplay.in, if this is Windows and we
         # are the primary; served once startup is done.
         self._single_instance = single_instance
+
+        # A window built ahead of time and kept hidden, out of the
+        # application's list, for the next file opened (see _take_window).
+        self._spare: CineWindow | None = None
+        self._spare_id = 0
+        # Whether we hold the application, which keeps it running with no
+        # windows left (the run-in-background setting).
+        self._background = False
 
         self.add_main_option(
             "new-window",
@@ -155,7 +177,97 @@ class CineApplication(Adw.Application):
         if self._single_instance is not None:
             self._single_instance.serve(self._on_forwarded_launch)
 
+        settings.connect("changed", self._on_setting_changed)
+        self._sync_background()
+
         trace("app started")
+
+    def _on_setting_changed(self, _settings, key):
+        if key == "run-in-background":
+            self._sync_background()
+        elif key not in SPARE_REFRESHED_KEYS:
+            # The spare window was built with the old value.
+            self._drop_spare()
+            self._schedule_spare()
+
+    def _sync_background(self):
+        """Hold the application, and keep a window ready, while the
+        run-in-background setting is on.
+
+        Only when the desktop started us: GNOME, file managers and the like
+        launch NekoPlay through D-Bus activation, as a service, and send
+        every later launch to it there - so they all find it running. A
+        launch from a terminal ends with its last window as it always did,
+        rather than leave the terminal waiting on a process with nothing on
+        screen; it hands its files to a running service if there is one.
+        """
+        wanted = settings.get_boolean("run-in-background") and bool(
+            self.get_flags() & Gio.ApplicationFlags.IS_SERVICE
+        )
+        if wanted == self._background:
+            return
+        self._background = wanted
+        if wanted:
+            self.hold()
+            self._schedule_spare()
+        else:
+            self._drop_spare()
+            self.release()
+
+    def _schedule_spare(self):
+        if self._background and self._spare is None and not self._spare_id:
+            self._spare_id = GLib.timeout_add(SPARE_WINDOW_DELAY_MS, self._build_spare)
+
+    def _build_spare(self):
+        """Build the next window now, while nobody is waiting for it."""
+        self._spare_id = 0
+        if not self._background or self._spare is not None:
+            return GLib.SOURCE_REMOVE
+        try:
+            win = CineWindow(application=self)
+            # Built as one of ours, then taken off the list until it is
+            # shown: hidden, it would still count as the active window,
+            # which is where files open and what the media controls follow.
+            self.remove_window(win)
+        except Exception:
+            logger.exception("Could not build a window ahead of time")
+            return GLib.SOURCE_REMOVE
+        self._spare = win
+        # Realized in a turn of its own, so that neither step holds up the
+        # main loop for long if another window is playing. A timeout rather
+        # than an idle: a window rendering video can keep idles waiting.
+        GLib.timeout_add(SPARE_PREPARE_DELAY_MS, self._prepare_spare, win)
+        return GLib.SOURCE_REMOVE
+
+    def _prepare_spare(self, win):
+        if self._spare is win:
+            try:
+                win.prepare()
+            except Exception:
+                logger.exception("Could not prepare a window ahead of time")
+        return GLib.SOURCE_REMOVE
+
+    def _drop_spare(self):
+        if self._spare_id:
+            GLib.source_remove(self._spare_id)
+            self._spare_id = 0
+        win, self._spare = self._spare, None
+        if win is not None:
+            win.close()
+
+    def _take_window(self, is_activate=False) -> CineWindow:
+        """A window to show: the one built ahead of time if there is one,
+        caught up with the settings, otherwise a new one."""
+        win, self._spare = self._spare, None
+        if win is not None and not win.mpv.core_shutdown:
+            self.add_window(win)
+            win.refresh_from_settings()
+            if is_activate and settings.get_boolean("save-session"):
+                win.restore_session()
+        else:
+            win = CineWindow(application=self, is_activate=is_activate)
+        self._schedule_spare()
+        return win
 
     def _on_forwarded_launch(self, payload: bytes) -> None:
         """A second launch sent us its arguments (pipe thread)."""
@@ -186,7 +298,7 @@ class CineApplication(Adw.Application):
         return False
 
     def do_activate(self):
-        win = CineWindow(application=self, is_activate=True)
+        win = self._take_window(is_activate=True)
         win.present()
         trace("window presented")
 
@@ -215,9 +327,15 @@ class CineApplication(Adw.Application):
             trace("loadfile issued")
 
         loads_queued = False
+        sized_by_mpv = False
         if open_new:
-            win = CineWindow(application=self)
+            win = self._take_window()
             win.start_page.set_visible(False)
+            # A window prepared ahead of time is shown as soon as mpv,
+            # which opens the files the moment it gets them, has the size.
+            sized_by_mpv = win.can_size_from_mpv
+            if sized_by_mpv:
+                win.present_when_sized()
 
             # Before anything below, all of which can wait: mpv opens the
             # file while this thread finds the window's size and realizes
@@ -227,25 +345,26 @@ class CineApplication(Adw.Application):
                 queue_loads()
                 loads_queued = True
 
-            first_video_path = None
-            for gfile in files:
-                first_video_path = self.find_first_file(gfile)
+            if not sized_by_mpv:
+                first_video_path = None
+                for gfile in files:
+                    first_video_path = self.find_first_file(gfile)
+
+                    if first_video_path:
+                        break
+
+                trace("first file found")
 
                 if first_video_path:
-                    break
-
-            trace("first file found")
-
-            if first_video_path:
-                # Sizes the window before the first frame arrives. Usually
-                # already answered: probe.prefetch started this while the
-                # process was still loading GTK.
-                size = probe.video_size(first_video_path)
-                if size:
-                    win.set_window_size(*size)
-                trace("size known")
-            win.present()
-            trace("window presented")
+                    # Sizes the window before the first frame arrives.
+                    # Usually already answered: probe.prefetch started this
+                    # while the process was still loading GTK.
+                    size = probe.video_size(first_video_path)
+                    if size:
+                        win.set_window_size(*size)
+                    trace("size known")
+                win.present()
+                trace("window presented")
         else:
             win.present()
             # Everything below is queued rather than waited for: mpv runs
@@ -399,6 +518,7 @@ class CineApplication(Adw.Application):
             self.set_accels_for_action(f"app.{name}", shortcuts)
 
     def _on_shutdown(self, *args):
+        self._drop_spare()
         for win in self.get_windows():
             win.close()
 

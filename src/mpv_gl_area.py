@@ -303,6 +303,9 @@ class VideoGLArea(BaseGLArea):
         self._gate_lock = threading.Lock()
         self._gate_open = False
         self._held: list[int] = []
+        # Called on mpv's event thread at each file's on_preloaded, before
+        # the load goes on, while property reads still get a quick answer.
+        self.on_preloaded = None
         self.holds_loads = self._hold_loads()
 
     def _hold_loads(self) -> bool:
@@ -329,6 +332,12 @@ class VideoGLArea(BaseGLArea):
                 if event.reply_userdata != _PRELOADED_HOOK:
                     return
                 hook_id = event.data.id
+                callback = self.on_preloaded
+                if callback is not None:
+                    try:
+                        callback()
+                    except Exception:
+                        logger.exception("on_preloaded callback failed")
                 with self._gate_lock:
                     if not self._gate_open:
                         self._held.append(hook_id)

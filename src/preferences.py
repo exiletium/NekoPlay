@@ -85,6 +85,7 @@ class Preferences(Adw.Dialog):
     copy_cmd_button: Gtk.Button = Gtk.Template.Child()
     open_new_row: Adw.SwitchRow = Gtk.Template.Child()
     thumb_preview_row: Adw.SwitchRow = Gtk.Template.Child()
+    background_row: Adw.SwitchRow = Gtk.Template.Child()
     offload_row: Adw.SwitchRow = Gtk.Template.Child()
     hwdec_row: Adw.SwitchRow = Gtk.Template.Child()
     normalize_volume_row: Adw.SwitchRow = Gtk.Template.Child()
@@ -122,6 +123,9 @@ class Preferences(Adw.Dialog):
 
         self._bind_ui()
         self._setup_mpv_updates()
+        # Only a desktop launch, through D-Bus activation, keeps running in
+        # the background (see CineApplication._sync_background).
+        self.background_row.set_visible(os.name != "nt")
 
         font = settings.get_string("subtitle-font")
         self.font_label.set_label(font)
@@ -160,6 +164,7 @@ class Preferences(Adw.Dialog):
         bindings = [
             ("open-new-windows", self.open_new_row, "active"),
             ("thumbnail-preview", self.thumb_preview_row, "active"),
+            ("run-in-background", self.background_row, "active"),
             ("normalize-volume", self.normalize_volume_row, "active"),
             ("graphics-offload", self.offload_row, "active"),
             ("hwdec", self.hwdec_row, "active"),
