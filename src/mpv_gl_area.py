@@ -172,9 +172,13 @@ class ThumbPreviewGLArea(BaseGLArea):
         self._is_seeking = False
         # Called once on the main loop when the file load_file opened has its
         # first frame; armed by that file's file-loaded, so a restart left
-        # over from a seek in the last file cannot set it off early.
+        # over from a seek in the last file cannot set it off early. Loads
+        # asked for and loads started tell that file's file-loaded apart
+        # from one the last file sent before it was replaced.
         self._on_loaded = None
         self._loaded_armed = False
+        self._loads_sent = 0
+        self._loads_started = 0
 
         @self._mpv.property_observer("seeking")
         def on_seeking_change(_name, seeking):
@@ -182,9 +186,14 @@ class ThumbPreviewGLArea(BaseGLArea):
                 self._is_seeking = False
                 self._flush_seek()
 
+        @self._mpv.event_callback("start-file")
+        def on_start_file(_event):
+            self._loads_started += 1
+
         @self._mpv.event_callback("file-loaded")
         def on_file_loaded(_event):
-            self._loaded_armed = True
+            if self._loads_started == self._loads_sent:
+                self._loaded_armed = True
 
         @self._mpv.event_callback("playback-restart")
         def on_playback_restart(_event):
@@ -232,10 +241,17 @@ class ThumbPreviewGLArea(BaseGLArea):
             self._is_seeking = False
             self._loaded_armed = False
             self._on_loaded = on_loaded
-            if start:
-                self._mpv.command("loadfile", target, "replace", -1, f"start={start:.3f}")
-            else:
-                self._mpv.command("loadfile", target, "replace")
+            # Counted first: its start-file may reach the event thread before
+            # the command returns here.
+            self._loads_sent += 1
+            try:
+                if start:
+                    self._mpv.command("loadfile", target, "replace", -1, f"start={start:.3f}")
+                else:
+                    self._mpv.command("loadfile", target, "replace")
+            except Exception:
+                self._loads_sent -= 1  # refused, so it will never start
+                raise
             return True
         except Exception:
             logger.exception("ThumbPreviewGLArea load_file failed")
