@@ -93,8 +93,9 @@ def _sync_entry(enabled: bool) -> None:
                 logger.exception("Could not remove %s", path)
         return
 
-    # The script that is running now: from a D-Bus activation that is the
-    # installed one, and a launch from elsewhere should come back the same.
+    # The command that started us (the launcher in bin/, which the script
+    # puts in argv[0]): from a D-Bus activation that is the installed one,
+    # and a launch from elsewhere should come back the same.
     wanted = _entry(os.path.abspath(sys.argv[0]))
     if current == wanted:
         return

@@ -55,7 +55,14 @@ if os.name == 'nt':
 
 sys.path.insert(1, pkgdatadir)
 
-if os.name != 'nt' and __name__ == '__main__':
+# Run by the launcher in bin/ (nekoplay-launcher-unix.c), which has already
+# tried the running instance. It is the command the user knows, so it
+# stands in for this script wherever the app names itself.
+_launcher = os.environ.pop('NEKOPLAY_LAUNCHER', None)
+if _launcher:
+    sys.argv[0] = _launcher
+
+if os.name != 'nt' and __name__ == '__main__' and not _launcher:
     # A launch while NekoPlay is running only hands its files over. On
     # Linux GApplication would do that over D-Bus anyway, but only once GTK
     # and the whole app were loaded: ~200 ms before the running instance

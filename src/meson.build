@@ -69,13 +69,30 @@ if is_windows
     install: true,
   )
 else
+  # The app itself is this script, run by the launcher below.
   configure_file(
     input: 'nekoplay.in',
-    output: 'nekoplay',
+    output: 'nekoplay.py',
     configuration: conf,
     install: true,
-    install_dir: get_option('bindir'),
-    install_mode: 'rwxr-xr-x'
+    install_dir: pkgdatadir,
+  )
+
+  # Hands a launch to the running instance without waiting for Python to
+  # start, and runs the script above otherwise. See
+  # nekoplay-launcher-unix.c.
+  add_languages('c', native: false, required: true)
+  launcher_conf = configuration_data()
+  launcher_conf.set_quoted('PYTHON', py_installation.full_path())
+  launcher_conf.set_quoted('SCRIPT', pkgdatadir / 'nekoplay.py')
+  launcher_conf.set_quoted('LAUNCHER_PATH',
+    get_option('prefix') / get_option('bindir') / 'nekoplay')
+  configure_file(output: 'launcher-config.h', configuration: launcher_conf)
+
+  executable('nekoplay',
+    'nekoplay-launcher-unix.c',
+    dependencies: dependency('gio-2.0', version: '>= 2.58'),
+    install: true,
   )
 endif
 
