@@ -18,6 +18,7 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 
 import bisect
+import collections
 import logging
 import os
 import shlex
@@ -119,6 +120,18 @@ THUMB_PREVIEW_DELAY_MS = 1000
 # How long a window that sizes itself from mpv (present_when_sized) waits to
 # be told the size before it is shown anyway. A local file takes a few ms.
 SIZE_WAIT_MS = 100
+
+# What a window built ahead of time plays, hidden, to have mpv build its
+# renderer before any real file needs it (CineWindow.warm_up): a clip mpv
+# makes itself, in the 8-bit 4:2:0 nearly every video is.
+WARM_UP_CLIP = "av://lavfi:color=c=black:s=640x360:r=25:d=10,format=yuv420p"
+# Drawn twice, scaled up and scaled down - the two ways a video usually
+# meets its window, for which mpv builds different passes.
+WARM_UP_TARGETS = ((DEFAULT_WIDTH, DEFAULT_HEIGHT), (320, 180))
+# What mpv says about the clip after it has ended arrives within this.
+WARM_UP_SETTLE_MS = 100
+# Given up on, with everything put back, if the clip has not ended by then.
+WARM_UP_TIMEOUT_MS = 3000
 
 
 class MPV(mpv.MPV):
@@ -244,6 +257,7 @@ class CineWindow(Adw.ApplicationWindow):
         self._loop_mode: str = "off"
         # Set by prepare(); see present_when_sized.
         self._sized_by_mpv = False
+        self._warm_up: dict | None = None
         self._size_waiter = None
         self._chapters: list = []
         self._curr_chapter_time = None
@@ -508,6 +522,109 @@ class CineWindow(Adw.ApplicationWindow):
             GLib.idle_add(show, size, priority=GLib.PRIORITY_HIGH)
 
         self._video_area.on_preloaded = report_size
+
+    @property
+    def warming_up(self) -> bool:
+        return self._warm_up is not None
+
+    def warm_up(self, done) -> bool:
+        """Play a throwaway clip, hidden, and draw it, so that the first file
+        this window is given finds mpv's renderer already built and draws
+        its first frame at once (see VideoGLArea.draw_offscreen).
+
+        Nothing in the window hears of the clip: until it is over, mpv's
+        events and property changes come here alone, apart from the hook
+        that holds loads and the shutdown event. *done* is called when it
+        is over. Returns False, and never calls *done*, if it did not start.
+        """
+        area = self._video_area
+        player = self.mpv
+        if (
+            self._closing
+            or self._warm_up is not None
+            or area.hook_callback is None
+            or not area.get_realized()
+            # Its hook would wait on a reply the window can no longer hear.
+            or self.video2x.recipe.active
+        ):
+            return False
+        heard = player._event_callbacks
+        state = {"heard": (heard, player._property_handlers), "done": done}
+
+        def on_event(event):  # mpv's event thread
+            eid = event.event_id.value
+            if eid == mpv.MpvEventID.PLAYBACK_RESTART:
+                GLib.idle_add(draw, priority=GLib.PRIORITY_HIGH)
+            elif eid == mpv.MpvEventID.END_FILE:
+                GLib.idle_add(settle)
+            elif eid == mpv.MpvEventID.SHUTDOWN:
+                for callback in heard:
+                    callback(event)
+
+        def draw():
+            if self._warm_up is state and not state.get("stopped"):
+                state["stopped"] = True
+                try:
+                    for width, height in WARM_UP_TARGETS:
+                        area.draw_offscreen(width, height)
+                except Exception:
+                    logger.exception("Could not draw ahead of time")
+                stop()
+            return GLib.SOURCE_REMOVE
+
+        def stop():
+            try:
+                player.command_async("stop")
+            except mpv.ShutdownError:
+                pass
+
+        def settle():
+            if self._warm_up is state:
+                GLib.timeout_add(WARM_UP_SETTLE_MS, finish)
+            return GLib.SOURCE_REMOVE
+
+        def finish():
+            if self._warm_up is state:
+                self.stop_warm_up()
+            return GLib.SOURCE_REMOVE
+
+        def give_up():
+            state["timeout"] = 0
+            if self._warm_up is state:
+                logger.warning("Drawing ahead of time took too long")
+                state["stopped"] = True
+                stop()
+                GLib.timeout_add(WARM_UP_SETTLE_MS, finish)
+            return GLib.SOURCE_REMOVE
+
+        self._warm_up = state
+        player._event_callbacks = [area.hook_callback, on_event]
+        player._property_handlers = collections.defaultdict(list)
+        state["timeout"] = GLib.timeout_add(WARM_UP_TIMEOUT_MS, give_up)
+        try:
+            # mpv itself keeps the watch history, and writes it on load.
+            player.command_async(
+                "loadfile", WARM_UP_CLIP, "replace", -1, "save-watch-history=no"
+            )
+        except Exception:
+            logger.exception("Could not start drawing ahead of time")
+            self.stop_warm_up()
+        return True
+
+    def stop_warm_up(self, give_back=True) -> bool:
+        """End warm_up now, whether or not the clip is over, and give the
+        window back its callbacks - unless *give_back* is False, for a
+        window about to close, which has nothing to hear about the clip
+        but the shutdown. True if one was under way."""
+        state, self._warm_up = self._warm_up, None
+        if state is None:
+            return False
+        if state.get("timeout"):
+            GLib.source_remove(state["timeout"])
+        if give_back:
+            self.mpv._event_callbacks, self.mpv._property_handlers = state["heard"]
+        state["done"]()
+        return True
 
     @property
     def can_size_from_mpv(self) -> bool:
@@ -2248,10 +2365,12 @@ class CineWindow(Adw.ApplicationWindow):
         # A load held for a render context that will now never exist would
         # keep mpv from quitting.
         self._video_area.release_loads()
+        # Its clip is nothing to remember.
+        warming = self.stop_warm_up(give_back=False)
         try:
             same_playlist = is_same_playlist(self.mpv.playlist)
             save_pos = settings.get_boolean("save-video-position")
-            if same_playlist or save_pos:
+            if not warming and (same_playlist or save_pos):
                 self.mpv.quit_watch_later()
             else:
                 self.mpv.quit()

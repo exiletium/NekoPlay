@@ -51,6 +51,40 @@ _hook_continue = mpv.backend.mpv_hook_continue
 _hook_continue.argtypes = [mpv.MpvHandle, ctypes.c_uint64]
 _hook_continue.restype = ctypes.c_int
 
+_GL_FRAMEBUFFER = 0x8D40
+_GL_FRAMEBUFFER_COMPLETE = 0x8CD5
+_GL_COLOR_ATTACHMENT0 = 0x8CE0
+_GL_TEXTURE_2D = 0x0DE1
+_GL_RGBA8 = 0x8058
+_GL_RGBA = 0x1908
+_GL_UNSIGNED_BYTE = 0x1401
+_GLuint = ctypes.c_uint
+_GLsizei = ctypes.c_int
+_GLint = ctypes.c_int
+# Name, return type, argument types: what draw_offscreen calls.
+_GL_FUNCS = (
+    ("glGenFramebuffers", None, (_GLsizei, ctypes.POINTER(_GLuint))),
+    ("glBindFramebuffer", None, (_GLuint, _GLuint)),
+    ("glDeleteFramebuffers", None, (_GLsizei, ctypes.POINTER(_GLuint))),
+    ("glFramebufferTexture2D", None, (_GLuint, _GLuint, _GLuint, _GLuint, _GLint)),
+    ("glCheckFramebufferStatus", _GLuint, (_GLuint,)),
+    ("glGenTextures", None, (_GLsizei, ctypes.POINTER(_GLuint))),
+    ("glBindTexture", None, (_GLuint, _GLuint)),
+    ("glDeleteTextures", None, (_GLsizei, ctypes.POINTER(_GLuint))),
+    ("glTexImage2D", None, (_GLuint, _GLint, _GLint, _GLsizei, _GLsizei, _GLint, _GLuint, _GLuint, ctypes.c_void_p)),
+)
+
+
+def _gl_funcs() -> dict | None:
+    """The GL functions draw_offscreen needs, from the current context."""
+    funcs = {}
+    for name, restype, argtypes in _GL_FUNCS:
+        addr = gl_get_proc_address(name.encode())
+        if not addr:
+            return None
+        funcs[name] = ctypes.CFUNCTYPE(restype, *argtypes)(addr)
+    return funcs
+
 # Tells our on_preloaded hook's events apart from anyone else's.
 _PRELOADED_HOOK = 0x6E656B6F
 
@@ -306,6 +340,7 @@ class VideoGLArea(BaseGLArea):
         # Called on mpv's event thread at each file's on_preloaded, before
         # the load goes on, while property reads still get a quick answer.
         self.on_preloaded = None
+        self.hook_callback = None
         self.holds_loads = self._hold_loads()
 
     def _hold_loads(self) -> bool:
@@ -347,6 +382,9 @@ class VideoGLArea(BaseGLArea):
 
             if _hook_add(handle, _PRELOADED_HOOK, b"on_preloaded", 0) < 0:
                 raise RuntimeError("mpv_hook_add failed")
+            # Whoever mutes this player's other callbacks has to keep this
+            # one: without it every load waits forever.
+            self.hook_callback = on_hook
             return True
         except Exception:
             logger.exception("Could not hold loads for the render context")
@@ -369,6 +407,49 @@ class VideoGLArea(BaseGLArea):
                 _hook_continue(self._mpv._event_handle, hook_id)
             except Exception:
                 logger.exception("Could not release a held load")
+
+    def draw_offscreen(self, width: int, height: int) -> bool:
+        """Have mpv draw its current frame into a buffer of our own, which
+        works while this area is realized but not on screen. True if it drew.
+
+        The first frame mpv draws costs several times what the rest do: it
+        builds every shader program and pass it will use, and the dither
+        matrix. Drawn here, ahead of time, that is done before anyone waits.
+        """
+        if self._ctx is None:
+            return False
+        self.make_current()
+        gl = _gl_funcs()
+        if gl is None:
+            return False
+        previous = ctypes.c_int()
+        gl_get_integerv(GL_FRAMEBUFFER_BINDING, previous)
+        fbo, texture = _GLuint(), _GLuint()
+        gl["glGenTextures"](1, ctypes.byref(texture))
+        gl["glGenFramebuffers"](1, ctypes.byref(fbo))
+        try:
+            gl["glBindTexture"](_GL_TEXTURE_2D, texture)
+            gl["glTexImage2D"](
+                _GL_TEXTURE_2D, 0, _GL_RGBA8, width, height, 0,
+                _GL_RGBA, _GL_UNSIGNED_BYTE, None,
+            )
+            gl["glBindTexture"](_GL_TEXTURE_2D, 0)
+            gl["glBindFramebuffer"](_GL_FRAMEBUFFER, fbo)
+            gl["glFramebufferTexture2D"](
+                _GL_FRAMEBUFFER, _GL_COLOR_ATTACHMENT0, _GL_TEXTURE_2D, texture, 0
+            )
+            if gl["glCheckFramebufferStatus"](_GL_FRAMEBUFFER) != _GL_FRAMEBUFFER_COMPLETE:
+                return False
+            self._ctx.render(
+                flip_y=True,
+                block_for_target_time=False,
+                opengl_fbo={"w": width, "h": height, "fbo": fbo.value},
+            )
+            return True
+        finally:
+            gl["glBindFramebuffer"](_GL_FRAMEBUFFER, previous.value)
+            gl["glDeleteFramebuffers"](1, ctypes.byref(fbo))
+            gl["glDeleteTextures"](1, ctypes.byref(texture))
 
     def _on_render(self, area, context):
         super()._on_render(area, context)

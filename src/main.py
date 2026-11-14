@@ -259,6 +259,16 @@ class CineApplication(Adw.Application):
                 win.prepare()
             except Exception:
                 logger.exception("Could not prepare a window ahead of time")
+            else:
+                GLib.timeout_add(SPARE_PREPARE_DELAY_MS, self._warm_spare, win)
+        return GLib.SOURCE_REMOVE
+
+    def _warm_spare(self, win):
+        if self._spare is win:
+            try:
+                win.warm_up(lambda: trace("spare warmed up"))
+            except Exception:
+                logger.exception("Could not draw ahead of time")
         return GLib.SOURCE_REMOVE
 
     def _drop_spare(self):
@@ -273,6 +283,11 @@ class CineApplication(Adw.Application):
         """A window to show: the one built ahead of time if there is one,
         caught up with the settings, otherwise a new one."""
         win, self._spare = self._spare, None
+        if win is not None and win.warming_up:
+            # Still playing its clip for the fraction of a second that
+            # takes; what it would hear of it is not for a window in use.
+            win.close()
+            win = None
         if win is not None and not win.mpv.core_shutdown:
             self.add_window(win)
             win.refresh_from_settings()
